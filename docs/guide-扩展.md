@@ -10,6 +10,8 @@
 | **站点插件** | cordis 插件：`ctx.provide('site.<id>', handler)` | 自定义"发现 URL"逻辑（分页/分类/去重） |
 | **装配声明** | `*.cordis.yml`（DSH 格式） | 声明插件列表 + 顺序 + 配置 |
 | **抓取器** | `cordis:fetcher` 插件（核心自带） | 把核心服务装配进上下文树并跑两阶段 |
+| **组合** | `cordis:include` 条目 | 多文件编排（站点清单拆分 / patches 覆盖层） |
+| **热更新 HMR** | `--watch` 文件监听 + `source/register` 事件 | 运行中新增站点 / 改插件，不重启 |
 | 解析规则 | config 的 `parseRule` | 详情页正文提取（无需写代码） |
 | 索引源 | `kind: 'index'` + `indexRule.linkRegex` | 目录页正则提取链接 |
 | 发现通道 | `discovery/bfs.ts`（站内 BFS） | 全站遍历（不依赖列表页结构） |
@@ -134,7 +136,74 @@ interface SiteHandler {
 ```
 discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤逻辑在 handler 里自己实现**（用 `source.filterKeywords` 判断），核心不做（每个站过滤规则不同）。
 
-## 四、解析规则 parseRule 全字段
+## 四、组合与热更新（HMR）：运行中新增站点
+
+### 组合：多文件编排（cordis:include）
+
+站点多了之后，把清单拆成文件，主清单只管组合：
+
+```yaml
+# app.cordis.yml
+- id: sites
+  name: 'cordis:include'
+  config:
+    path: './sites.cordis.yml'     # 子清单（可再嵌套 include）
+    patches: [...]                 # 可选：DSH PatchOptions 覆盖层（按 id 覆盖/插入条目）
+- id: fetcher
+  name: 'cordis:fetcher'
+  config:
+    config: './config.json'
+    watch: true                    # 常驻模式（配合 --watch 使用）
+```
+
+```bash
+node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --cordis app.cordis.yml --watch
+# 或叠加覆盖层：--patch sites.local.yml
+```
+
+### HMR：运行中热新增站点（不重启）
+
+`--watch` 启动后进程常驻（文件监听维持），往任意 include 文件里**追加一个站点条目**即自动生效：
+
+```yaml
+# 运行中往 sites.cordis.yml 追加：
+- id: my-new-site
+  name: './sites/my-new-site.ts'
+  config:
+    source:                        # ← 源配置随条目走（fetcher 收到后自动开抓）
+      id: 'my-new-site'
+      kind: 'site'
+      siteHandler: 'my-new-site'
+      seedUrls: ['https://example.com/']
+      parseRule: { encoding: 'utf-8', section: '#content', minLen: 40 }
+```
+
+站点插件只需两件事（插件 apply 时）：
+
+```ts
+export default function myNewSite(ctx: Context, config: any) {
+  ctx.provide('site.my-new-site', { id: 'my-new-site', discover: async (ctx, source) => { /* ... */ } })
+  if (config?.source) ctx.emit('source/register', config.source)   // 通知 fetcher 热接入
+}
+```
+
+流程：文件变化（300ms 防抖）→ include 事务刷新 → 新条目 apply（provide + emit）→ fetcher 收到 `source/register` → 自动为该源跑一轮（发现 → 入队 → 落定），老源不受影响。
+
+其他热更新行为：
+
+| 操作 | 效果 |
+|---|---|
+| 追加新站点条目（含 source 配置） | 自动应用 + 自动抓取 |
+| 修改站点插件 `.ts` / 条目配置 | 该条目重启（重新 import + apply，已爬 URL 由 done.urls/visited 去重续爬） |
+| 删除条目 | 优雅卸载（site.<id> 服务注销） |
+| 修改 fetcher 条目自身配置 | 整个 fetcher 重启（断点续跑）——属预期语义 |
+| patch 覆盖层文件变更 | 需重启进程（v1 不监听 patch 文件） |
+
+暂停/退出：`state/pause_crawls.flag` → checkpoint 落盘 → 干净退出（exit 0）；Ctrl+C 同理。
+
+> 冷启动说明：初始抓取源以 fetcher 配置（config.json 的 `sources`）为准；`source/register` 是运行期热接入通道（冷启动时事件先于 fetcher 监听，故新增站点要么写进 config.json 后重启，要么运行中加条目热接入）。
+
+## 五、解析规则 parseRule 全字段
 
 ```jsonc
 "parseRule": {
@@ -150,7 +219,7 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 }
 ```
 
-## 五、二进制下载源（音频/压缩包）
+## 六、二进制下载源（音频/压缩包）
 
 ```jsonc
 { "id": "audio", "kind": "index", "downloadRaw": true,
@@ -162,7 +231,7 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 - 断点续传：完成一个记一个（`data_audio/<source>.meta.jsonl`）
 - 认证：worker 支持 `authHeaders`（如 `{ "Authorization": "Bearer xxx" }`）或 `hfToken`（兼容）
 
-## 六、管理服务（可选开启）
+## 七、管理服务（可选开启）
 
 ```jsonc
 { "manage": { "enabled": true, "port": 8787, "api": true, "web": true } }
@@ -173,7 +242,7 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 - `POST /api/resume`：恢复（看护自动拉起）
 - `GET /`：浏览器管理页（自动刷新）
 
-## 七、优雅暂停机制（了解即可）
+## 八、优雅暂停机制（了解即可）
 
 ```
 crawl_ctl 或管理服务 → 写 state/pause_crawls.flag
@@ -183,7 +252,7 @@ crawl_ctl 或管理服务 → 写 state/pause_crawls.flag
 删除 flag → 看护器/手动重新拉起 → 断点续跑
 ```
 
-## 八、最佳实践
+## 九、最佳实践
 
 1. **发现幂等**：discover 返回的 URL 重复没关系（scheduler 去重 + done.urls 兜底）
 2. **礼貌限速**：慢站用 `concurrency: 2` + `requeueDelayMs: 8000` 起步
@@ -193,7 +262,7 @@ crawl_ctl 或管理服务 → 写 state/pause_crawls.flag
 
 **下一步**：读《架构说明》（调度器内部/断点格式/事件日志）。
 
-## 九、自由扩展（cordis 能力——不再黑盒）
+## 十、自由扩展（cordis 能力——不再黑盒）
 
 核心的装配单位就是 cordis 本身。除了 cordis.yml 里的站点插件，还有以下扩展面：
 

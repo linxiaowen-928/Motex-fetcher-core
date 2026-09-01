@@ -11,3 +11,5 @@ pool-selftest/
 
 # 本地 TODO（不入库）
 NEXT_TODO.md
+
+.hmr-test/

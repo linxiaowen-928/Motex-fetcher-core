@@ -1,15 +1,16 @@
-# cordis.yml 自检：完整验证 DSH 式声明式装配链路
-#   loader（--cordis）→ 站点插件（DI 提供 site.selftest-site）→ fetcher 插件（装配核心服务 + 两阶段执行 + 断言）
+# cordis.yml 自检：完整验证 DSH 式声明式装配链路（含组合 include）
+#   loader（--cordis）→ 组合（include 子清单）→ 站点插件（DI 提供 site.selftest-site）→ fetcher 插件（装配核心服务 + 两阶段执行 + 断言）
 #
 # 运行：npm run self-test-cordis
 # 期望输出：[self-test] ALL PASS ✅
 #
 # 顺序要求：站点插件条目必须排在 fetcher 之前（先提供 site.<id>，fetcher 装配后即可 DI 分派）。
 
-# 站点插件：相对路径（相对本文件），保留 .ts 由 strip-types 直接加载
-- id: selftest-site
-  name: './selftest-site.ts'
-  config: {}
+# 组合：站点清单独立成文件（selftest-sites.cordis.yml），主文件 include 挂载
+- id: sites
+  name: 'cordis:include'
+  config:
+    path: './selftest-sites.cordis.yml'
 
 # fetcher 插件：cordis 内建（等价 'motex-fetcher-core/fetcher'，用户项目里两种写法都行）
 - id: fetcher

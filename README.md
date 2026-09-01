@@ -9,6 +9,7 @@
 - **存储**：JSONL 落盘 + **64MB 分片自动切换**（`.partN`）+ 已爬记录（`.done.urls` 快路径）
 - **二进制下载**：`downloadRaw` 源 → 独立 worker 进程（Range 1MB 分块并行 / 断点续传 / 任意认证头），抗慢网与大文件
 - **cordis 原生装配**：DSH 式 `*.cordis.yml` 声明式启动；站点插件 = cordis 插件（`ctx.provide('site.<id>', handler)`）；用户插件可监听事件/替换服务
+- **组合与热更新（HMR）**：`cordis:include` 多文件组合 + `--watch` 文件监听——运行中往 cordis.yml 加一个站点条目，自动应用并开始抓取，全程不重启
 - **日志**：tlog 结构化 JSONL（按站分文件、心跳、stall 告警）
 - **优雅暂停**：`pause_crawls.flag` 检测 → checkpoint 落盘 → 干净退出
 
@@ -44,6 +45,11 @@ node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --cor
 
 ```bash
 node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --config ./config.json --phase both
+```
+
+```bash
+# 常驻 + 热更新：运行中新增站点（往 app.cordis.yml 加条目即生效）
+node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --cordis app.cordis.yml --watch
 ```
 
 ### 扩展一个站点（cordis 插件 = 一个站）

@@ -8,7 +8,7 @@
 src/
 ├── index.ts              # 核心：createApp/assembleApp（装配服务）/ runPhase（两阶段执行）/ main（CLI）
 ├── fetcher.ts            # fetcher 插件：cordis 插件形式 = 装配核心服务 + 跑两阶段
-├── loader.ts             # cordis.yml 装载器（DSH 同款格式：id/name/config/disabled/group/isolate）
+├── loader.ts             # cordis.yml 装载器（root include 组合 + patches 覆盖层 + --watch 热更新）
 ├── cli.ts                # CLI 入口（--config / --self-test / --cordis）
 ├── config.ts             # 配置契约（sources/scheduler/storage/manage）+ 默认值
 ├── types.ts              # 核心类型（FetchJob/FetchResponse/IndexRecord/ParsedItem/SiteHandler）+ 事件契约
@@ -42,8 +42,10 @@ app.cordis.yml（loader.ts 解析，DSH 格式）
 
 - **同一上下文树**：站点插件与核心服务共享 cordis 作用域 DI 与事件总线（无 isolate = root realm 全局共享）
 - **indexer 分派**：`ctx.get('site.' + source.siteHandler)`——站点处理器即服务，插件替换 = 换服务实现
+- **root include 装载**：mountCordis 以 `cordis:include` 为根条目（DSH 同款）——主文件驱动整棵树，嵌套 include 实现多文件组合；`--patch` 覆盖层走 DSH PatchOptions 语义
+- **热更新（watch 模式）**：startWatcher 监听 include 文件与相对路径插件文件（防抖 300ms）→ include.refresh() 事务性刷新子树 / 条目 force 重启；进程常驻由 fs.watch（persistent）维持；新增站点 = 条目 apply 时 `ctx.emit('source/register', sourceConfig)` → fetcher watch 监听器收单源一轮（发现 → 入队 → 落定）；暂停 → `pause/clean` 事件 → CLI 干净退出
 - **暂停语义**：`state/pause_crawls.flag` → 5s 内 checkpoint 落盘 → `{paused:true}` 干净返回（CLI exit 0）；scheduler.pause() 停止取新任务并立即结算批次
-- **注意**：cordis v4 在 active fiber 内 `ctx.plugin()` 且带 `inject` 的插件会延迟到父 fiber 结束才 apply——因此 pipeline 插件不声明 inject（服务经 ctx 惰性解析）
+- **注意**：cordis v4 在 active fiber 内 `ctx.plugin()` 且带 `inject` 的插件会延迟到父 fiber 结束才 apply——因此 pipeline 插件不声明 inject（服务经 ctx 惰性解析）；fetcher watch 模式的 apply 正常返回（不阻塞装载，否则 loader 的 create() 挂起、文件监听永不启动）
 
 ## 二、两阶段数据流
 

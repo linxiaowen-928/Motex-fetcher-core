@@ -1,0 +1,5 @@
+# 站点清单（被 selftest.cordis.yml 的 cordis:include 组合挂载）
+# 独立成文件的意义：站点可以各自一个文件，主清单只管组合顺序。
+- id: selftest-site
+  name: './selftest-site.ts'
+  config: {}

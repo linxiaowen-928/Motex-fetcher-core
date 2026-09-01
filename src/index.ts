@@ -247,6 +247,7 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
         }
         paused = true
         app.scheduler.pause()
+        app.emit('pause/clean')
         tlog({ ev: 'paused_clean', ok: app.scheduler.stats.ok, failed: app.scheduler.stats.failed, requeued: app.scheduler.stats.requeued })
       }
     } catch { /* 检测失败不阻塞主流程 */ }

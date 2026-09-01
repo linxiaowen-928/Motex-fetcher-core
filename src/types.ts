@@ -25,6 +25,10 @@ declare module '@deepseek-ai/cordis' {
     'fetch/failed'(res: FetchResponse): void
     /** 一条解析出的正文条目落盘前派发（供后续扩展：去重/筛选/入库） */
     'fetch/parsed'(res: FetchResponse, item: ParsedItem): void
+    /** 站点插件注册源配置（运行中热接入：fetcher watch 模式监听后自动抓取该源） */
+    'source/register'(source: SourceConfig): void
+    /** 优雅暂停完成（checkpoint 已落盘、调度器已停止）——watch 常驻模式的干净退出信号 */
+    'pause/clean'(): void
   }
 }
 
