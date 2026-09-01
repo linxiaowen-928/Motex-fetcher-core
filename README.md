@@ -80,6 +80,6 @@ src/
 - `POST /api/instances` 图形化新增实例入口（接口预留，未实现）
 
 默认关闭（不配 `manage` 即不启动）。
-## 许可
+## 文档`n`n- [docs/README.md](docs/README.md)——入门 / 扩展开发 / 架构说明`n`n## 许可
 
 MIT
