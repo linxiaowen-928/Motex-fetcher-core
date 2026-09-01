@@ -213,7 +213,7 @@ export async function main(argv?: string[]) {
         process.exit(0)
       }
     } catch { /* 检测失败不阻塞主流程 */ }
-  }, 5000) : null
+  }, 5000).unref() : null
 
   if (phase !== 'crawl') {
     for (const source of cfg.sources) {
