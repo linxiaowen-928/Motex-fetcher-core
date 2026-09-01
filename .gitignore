@@ -1,4 +1,4 @@
-﻿node_modules/
+node_modules/
 *.log
 state/
 out/
@@ -7,3 +7,6 @@ data_audio/
 out-selftest/
 state-selftest/
 pool-selftest/
+
+# 本地 TODO（不入库）
+NEXT_TODO.md
