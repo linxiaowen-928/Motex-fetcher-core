@@ -13,9 +13,10 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, write
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { join, resolve } from 'node:path'
-import { loadConfig, type FetcherConfig } from './config.ts'
+import { loadConfig, type FetcherConfig, type SchedulerConfig, type StorageConfig } from './config.ts'
 import { SchedulerService, type SchedulerSnapshot } from './services/scheduler.ts'
-import { IndexerService } from './services/indexer.ts'
+export { SchedulerService, IndexerService, ParserService, StorageService }
+import { IndexerService } from './services/indexer.ts' // re-export 见下方
 import { ParserService } from './services/parser.ts'
 import { StorageService } from './services/storage.ts'
 import { pipelinePlugin } from './plugins/pipeline.ts'
@@ -25,7 +26,42 @@ import { freshLogFile, setTraceFile, tlog } from './trace.ts'
 
 const enc = new TextEncoder()
 
-export async function main(argv?: string[]) {
+/**
+ * 扩展选项：把 cordis 的 DI/事件/插件能力暴露给使用方——
+ * - services：替换核心服务（自定义 scheduler/storage/parser/indexer，可继承默认类魔改）
+ * - plugins：注册额外 cordis 插件（监听事件、注入服务）
+ * - beforeServices / afterServices：装配前后钩子（任意魔改，如覆盖 scheduler.client 自定义网络层）
+ */
+export interface FetchCoreOptions {
+  services?: Partial<{
+    scheduler: new (ctx: Context, cfg: SchedulerConfig) => SchedulerService
+    indexer: new (ctx: Context) => IndexerService
+    parser: new (ctx: Context) => ParserService
+    storage: new (ctx: Context, cfg: StorageConfig) => StorageService
+  }>
+  plugins?: any[]
+  beforeServices?: (ctx: Context, cfg: FetcherConfig) => void
+  afterServices?: (ctx: Context, cfg: FetcherConfig) => void
+}
+
+/** 装配核心上下文（可替换服务/注册插件/钩子魔改），返回 cordis Context 供使用方自由扩展 */
+export function createApp(cfg: FetcherConfig, opts: FetchCoreOptions = {}): Context {
+  const app = new Context()
+  opts.beforeServices?.(app, cfg)
+  const S = opts.services?.scheduler ?? SchedulerService
+  new S(app, cfg.scheduler)
+  const I = opts.services?.indexer ?? IndexerService
+  new I(app)
+  const P = opts.services?.parser ?? ParserService
+  new P(app)
+  const St = opts.services?.storage ?? StorageService
+  new St(app, cfg.storage)
+  app.plugin(pipelinePlugin, cfg)
+  for (const p of opts.plugins ?? []) app.plugin(p, cfg)
+  opts.afterServices?.(app, cfg)
+  return app
+}
+export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
   const args = argv ?? process.argv.slice(2)
   const selfTest = args.includes('--self-test')
   const configPath = parseConfigPath(args)
@@ -100,12 +136,8 @@ export async function main(argv?: string[]) {
   }
 
   // 根上下文：注册全部服务（作用域 DI：服务挂到 ctx 上按名注入）
-  const app = new Context()
-  new SchedulerService(app, cfg.scheduler)
-  new IndexerService(app)
-  new ParserService(app)
-  new StorageService(app, cfg.storage)
-  app.plugin(pipelinePlugin, cfg)
+  // createApp 暴露 cordis 装配能力：服务可替换 / 插件可注册 / 前后钩子可魔改
+  const app = createApp(cfg, opts)
 
   // ===== 两阶段模式（前置声明：自检/恢复分支也要用） =====
   const indexFile = cfg.indexFile ?? 'pool/index.jsonl'
