@@ -343,7 +343,6 @@ export async function main(argv?: string[]) {
     } finally {
       if (iv) clearInterval(iv)
       tlog({ ev: 'end', phase, ok: s.ok, failed: s.failed, requeued: s.requeued, skipped: s.skipped })
-      if (!selfTest) tlog({ ev: 'crawl_progress', ok: st.ok, failed: st.failed, requeued: st.requeued, conc: app.scheduler.config.concurrency, pool: pool.length })
     }
   }
 
