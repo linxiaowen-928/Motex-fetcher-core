@@ -25,8 +25,8 @@ import { freshLogFile, setTraceFile, tlog } from './trace.ts'
 
 const enc = new TextEncoder()
 
-async function main() {
-  const args = process.argv.slice(2)
+export async function main(argv?: string[]) {
+  const args = argv ?? process.argv.slice(2)
   const selfTest = args.includes('--self-test')
   const configPath = parseConfigPath(args)
 
@@ -411,8 +411,3 @@ function loadIndex(indexFile: string): { url: string; source: string }[] {
     return []
   }
 }
-
-main().catch((e) => {
-  console.error('[motex-fetcher] 致命错误:', e)
-  process.exit(1)
-})
