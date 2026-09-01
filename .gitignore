@@ -13,3 +13,6 @@ pool-selftest/
 NEXT_TODO.md
 
 .hmr-test/
+
+state-cap/
+.cap-check/
