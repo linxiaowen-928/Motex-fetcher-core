@@ -1,31 +1,84 @@
 # Motex-fetcher-core 扩展开发指南
 
-> 学会写自己的站点处理器、发现逻辑、下载源，并开启管理服务。
+> 学会写自己的站点插件、发现逻辑、下载源，并开启管理服务。
+> 核心机制是 **cordis**（DSH 同款插件框架）：站点 = 插件，抓取器 = 插件，装配 = cordis.yml。
 
 ## 一、扩展点总览
 
 | 扩展点 | 机制 | 适用 |
 |---|---|---|
-| 站点处理器 | `registerSiteHandler({id, discover})` | 自定义"发现 URL"逻辑（分页/分类/去重） |
+| **站点插件** | cordis 插件：`ctx.provide('site.<id>', handler)` | 自定义"发现 URL"逻辑（分页/分类/去重） |
+| **装配声明** | `*.cordis.yml`（DSH 格式） | 声明插件列表 + 顺序 + 配置 |
+| **抓取器** | `cordis:fetcher` 插件（核心自带） | 把核心服务装配进上下文树并跑两阶段 |
 | 解析规则 | config 的 `parseRule` | 详情页正文提取（无需写代码） |
 | 索引源 | `kind: 'index'` + `indexRule.linkRegex` | 目录页正则提取链接 |
 | 发现通道 | `discovery/bfs.ts`（站内 BFS） | 全站遍历（不依赖列表页结构） |
 | 追更 | `discovery/update.ts`（ongoing 标记） | 连载内容增量更新 |
 | 下载源 | `downloadRaw: true` | 二进制大文件（音频/压缩包） |
 | 管理服务 | config 的 `manage` | 浏览器/API 看状态、暂停/恢复 |
+| **自由扩展** | 事件监听 / 服务替换 / 插件注册 | 统计、入库、告警、魔改任意环节 |
 
-## 二、站点处理器（最常用扩展）
+## 二、cordis.yml：声明式装配（DSH 同款）
+
+启动不再靠散落的代码注册，而是**一份清单**——与 DSH 的 `*.cordis.yml` 相同格式：
+
+```yaml
+# app.cordis.yml（顶层 = YAML 数组，按顺序应用）
+- id: 示例站
+  name: './sites/示例站.ts'          # 插件：相对路径（相对本文件）/ 包名 / cordis: 内建
+  config: { }                      # 插件配置
+
+- id: fetcher
+  name: 'cordis:fetcher'           # 内建抓取器（等价 'motex-fetcher-core/fetcher'）
+  config:
+    config: './config.json'        # 抓取器配置（sources/scheduler/storage）
+    phase: 'both'                  # 可选：index / crawl / both / update
+    concurrency: 4                 # 可选：覆盖调度并发
+    limit: 0                       # 可选：本次最多抓取 URL 数（0 = 不限）
+```
+
+```bash
+node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --cordis app.cordis.yml
+```
+
+支持字段（与 DSH 对齐）：
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 条目 id（日志/报错定位） |
+| `name` | 插件：相对路径（保留 `.ts` 由 strip-types 加载）/ 包名 / `cordis:group` / `cordis:fetcher` |
+| `config` | 插件配置；group 条目 = 子条目数组 |
+| `disabled` | `true` 或 `!!js 表达式`（如 `!!js process.platform === 'win32'`） |
+| `group` | 分组标记（`name: 'cordis:group'` + `config: [子项]`） |
+| `isolate` | 服务隔离（默认无隔离 = root realm 全树共享，站点插件与 fetcher 之间 DI 互通） |
+
+**顺序要求**：站点插件条目必须排在 fetcher 之前（先 `provide('site.<id>')`，fetcher 装配后 indexer 才能经 DI 分派到它）。
+
+### 用户项目里怎么引用核心
+
+核心未发布 npm 时，在你的项目里建 junction 后裸包名可用：
+
+```powershell
+# 你的项目目录下（node_modules 里）
+New-Item -ItemType Junction -Path node_modules\motex-fetcher-core -Target D:\path\to\Motex-fetcher-core
+```
+
+这样 `name: 'motex-fetcher-core/fetcher'`（或 `import { ... } from 'motex-fetcher-core'`）都能解析；`cordis:fetcher` 内建写法则完全不需要安装。
+
+## 三、站点插件（最常用扩展）
 
 ### 生命周期
 
 ```
-config.sources 里声明 { "kind": "site", "siteHandler": "my-site" }
+cordis.yml 里声明站点插件条目（先于 fetcher）
         ↓
-核心调用你注册的 discover(ctx, source)
+插件 apply：ctx.provide('site.my-site', handler)
         ↓
-你返回 URL 列表（可同时 pushIndex 入池）
+fetcher 装配核心服务到同一上下文树
         ↓
-核心把这些 URL 交给 crawl 阶段（并发/重试/断点自动）
+index 阶段：indexer 发现 → ctx.get('site.my-site') → 调 handler.discover(ctx, source)
+        ↓
+你返回 URL 列表 → crawl 阶段（并发/重试/断点自动）
         ↓
 每个 URL 抓下来 → 按 parseRule 解析 → 落盘
 ```
@@ -33,21 +86,23 @@ config.sources 里声明 { "kind": "site", "siteHandler": "my-site" }
 ### 最小示例
 
 ```ts
-// my-handler.ts
-import { registerSiteHandler } from './core/src/discovery/registry.ts'
-import { extractLinks } from './core/src/rules.ts'
+// sites/my-site.ts
+import { Context } from '@deepseek-ai/cordis'
+import type { SiteHandler } from 'motex-fetcher-core'
 
-registerSiteHandler({
-  id: 'my-site',
-  discover: async (ctx, source) => {
-    // 1. 抓种子页（scheduler.client 走并发/重试/代理）
-    const res = await ctx.scheduler.client(source.seedUrls[0], 20000)
-    if (!res.ok || !res.body) return []
-    const html = new TextDecoder().decode(res.body)
-    // 2. 提取链接（extractLinks 自动拼绝对 URL）
-    return extractLinks(html, /href="(\/detail\/\d+\.html)"/g, source.seedUrls[0])
-  },
-})
+export default function mySitePlugin(ctx: Context) {
+  ctx.provide('site.my-site', {
+    id: 'my-site',
+    discover: async (ctx, source) => {
+      // 1. 抓种子页（scheduler.client 走并发/重试/代理）
+      const res = await ctx.scheduler.client(source.seedUrls[0], 20000)
+      if (!res.ok || !res.body) return []
+      const html = new TextDecoder().decode(res.body)
+      // 2. 提取链接（extractLinks 自动拼绝对 URL）
+      return extractLinks(html, /href="(\/detail\/\d+\.html)"/g, source.seedUrls[0])
+    },
+  } satisfies SiteHandler)
+}
 ```
 
 ### discover 签名
@@ -79,7 +134,7 @@ interface SiteHandler {
 ```
 discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤逻辑在 handler 里自己实现**（用 `source.filterKeywords` 判断），核心不做（每个站过滤规则不同）。
 
-## 三、解析规则 parseRule 全字段
+## 四、解析规则 parseRule 全字段
 
 ```jsonc
 "parseRule": {
@@ -95,7 +150,7 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 }
 ```
 
-## 四、二进制下载源（音频/压缩包）
+## 五、二进制下载源（音频/压缩包）
 
 ```jsonc
 { "id": "audio", "kind": "index", "downloadRaw": true,
@@ -107,7 +162,7 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 - 断点续传：完成一个记一个（`data_audio/<source>.meta.jsonl`）
 - 认证：worker 支持 `authHeaders`（如 `{ "Authorization": "Bearer xxx" }`）或 `hfToken`（兼容）
 
-## 五、管理服务（可选开启）
+## 六、管理服务（可选开启）
 
 ```jsonc
 { "manage": { "enabled": true, "port": 8787, "api": true, "web": true } }
@@ -118,95 +173,90 @@ discover 返回的 URL 如果标题命中关键词，会被过滤——**过滤�
 - `POST /api/resume`：恢复（看护自动拉起）
 - `GET /`：浏览器管理页（自动刷新）
 
-## 六、优雅暂停机制（了解即可）
+## 七、优雅暂停机制（了解即可）
 
 ```
 crawl_ctl 或管理服务 → 写 state/pause_crawls.flag
         ↓
-运行中的任务每 5s 检测 flag → checkpoint 落盘 → 干净退出
+运行中的任务每 5s 检测 flag → checkpoint 落盘 → 干净退出（exit 0）
         ↓
 删除 flag → 看护器/手动重新拉起 → 断点续跑
 ```
 
-## 七、最佳实践
+## 八、最佳实践
 
 1. **发现幂等**：discover 返回的 URL 重复没关系（scheduler 去重 + done.urls 兜底）
 2. **礼貌限速**：慢站用 `concurrency: 2` + `requeueDelayMs: 8000` 起步
-3. **验证一次**：先 `--limit 5` 小批跑通，再看 out/ 产物确认解析正确
+3. **验证一次**：fetcher 配置里先 `limit: 5` 小批跑通，再看 out/ 产物确认解析正确
 4. **大文件源**：用 `downloadRaw` + 独立 worker（不要走正文管线）
 5. **断点是资产**：`state/`、`pool/`、`out/` 都是可恢复资产，别随手删
 
 **下一步**：读《架构说明》（调度器内部/断点格式/事件日志）。
 
-## 八、自由扩展（cordis 能力——不再黑盒）
+## 九、自由扩展（cordis 能力——不再黑盒）
 
-核心内部基于 `@deepseek-ai/cordis`（DI 容器 + 事件 + 插件）。通过 `main(argv, opts)` / `createApp(cfg, opts)` 把这些能力暴露给使用方。
+核心的装配单位就是 cordis 本身。除了 cordis.yml 里的站点插件，还有以下扩展面：
 
-### 1. 自定义插件（监听事件）
+### 1. 用户插件（监听事件）
 
 ```ts
-import { main } from './core/src/index.ts'
+// my-stats.ts —— 放进 cordis.yml 即可
+import { Context } from '@deepseek-ai/cordis'
 
-await main(['--config', './config.json'], {
-  plugins: [{
-    name: 'my-stats',
-    apply(ctx) {
-      ctx.on('fetch/parsed', (res, item) => { /* 每条落盘前：统计/入库/转发 */ })
-      ctx.on('fetch/failed', (res) => { /* 失败告警 */ })
-    },
-  }],
-})
+export default function myStats(ctx: Context) {
+  ctx.on('fetch/parsed', (res, item) => { /* 每条落盘前：统计/入库/转发 */ })
+  ctx.on('fetch/failed', (res) => { /* 失败告警 */ })
+  ctx.on('fetch/response', (res) => { /* 全量响应流 */ })
+}
 ```
 
-### 2. 装配钩子（任意魔改）
+### 2. 替换核心服务（继承默认类魔改）
 
 ```ts
-await main(['--config', './config.json'], {
-  beforeServices(ctx) { /* 服务装配前：注册自己的服务/中间件 */ },
-  afterServices(ctx) {
-    // 例：覆盖网络客户端（自定义抓取逻辑/代理/伪装）
-    ctx.scheduler.client = async (url: string, timeoutMs: number) => {
-      // 自己的 fetch 逻辑（可加 UA/代理/重试策略）
-      const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
-      return { status: r.status, ok: r.ok, body: new Uint8Array(await r.arrayBuffer()) }
-    }
-  },
-})
-```
-
-### 3. 替换核心服务（继承默认类魔改）
-
-```ts
-import { createApp, SchedulerService } from './core/src/index.ts'
-import { loadConfig } from './core/src/config.ts'
+import { createApp, SchedulerService, loadConfig } from 'motex-fetcher-core'
 
 class MyScheduler extends SchedulerService {
   // 魔改：例如自定义 429 策略 / 额外统计
   protected override noticeLimited(now: number) { /* ... */ }
 }
 
-const cfg = loadConfig('./config.json')
-const app = createApp(cfg, {
+const app = createApp(loadConfig('./config.json'), {
   services: { scheduler: MyScheduler },   // 换掉调度器，其余默认
 })
-// app 就是 cordis Context——之后想怎么玩怎么玩（直接 push/监听/自己跑阶段）
 ```
 
-### 4. 只拿 app 自己玩（不跑两阶段）
+### 3. 只拿 app 自己玩（不跑两阶段）
 
 ```ts
-import { createApp } from './core/src/index.ts'
-import { loadConfig } from './core/src/config.ts'
+import { createApp, loadConfig } from 'motex-fetcher-core'
 
 const app = createApp(loadConfig('./config.json'))
 await app.scheduler.push(['https://example.com/a'], 'demo', 0)  // 直接用调度器
-app.scheduler.waitIdle()                                        // 等完成
+await app.scheduler.waitIdle()                                  // 等完成
 // 落盘逻辑在 pipeline 插件里（fetch/response → parse → storage）
+```
+
+### 4. 程序化跑两阶段（等价 cordis:fetcher 插件内部）
+
+```ts
+import { createApp, runPhase, loadConfig } from 'motex-fetcher-core'
+
+const app = createApp(loadConfig('./config.json'))
+const { paused } = await runPhase(app, cfg, { phase: 'both', concurrency: 4 })
+```
+
+### 5. 把核心装进你自己的 cordis 应用
+
+```ts
+import { assembleApp, runPhase } from 'motex-fetcher-core'
+// app 是你的 cordis Context（任何来源：new Context() / loader / 宿主应用）
+assembleApp(app, cfg)                    // 服务装配到现有 ctx（与站点插件共享 DI）
+await runPhase(app, cfg, { phase: 'both' })
 ```
 
 ### 原则
 
 - **默认装配** = 开箱即用（两阶段管线）
-- **opts** = 打开 cordis 的任意扩展面（DI 替换 / 事件 / 插件）
-- **createApp 返回的 Context** = 完整 cordis 上下文，可自由注入/监听/扩展
+- **cordis.yml** = 声明式组装（站点插件 / 用户插件 / fetcher，顺序即依赖）
+- **createApp / assembleApp 返回的 Context** = 完整 cordis 上下文，可自由注入/监听/扩展
 - 想替换什么就替换什么，不想替换就全默认——**自由度在你手里**

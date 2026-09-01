@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path'
 import { Context, Service } from '@deepseek-ai/cordis'
 import type { SourceConfig } from '../config.ts'
 import { decodeBytes, extractLinks } from '../rules.ts'
-import { getSiteHandler } from '../discovery/registry.ts'
+import type { SiteHandler } from '../types.ts'
 import type { IndexRecord } from '../types.ts'
 
 export class IndexerService extends Service {
@@ -38,12 +38,13 @@ export class IndexerService extends Service {
   /** 返回该源应当抓取的 URL 列表（site 处理器同时会把条目写入索引池） */
   async discover(source: SourceConfig): Promise<string[]> {
     if (source.kind === 'site') {
-      const h = source.siteHandler ? getSiteHandler(source.siteHandler) : undefined
-      if (!h) {
-        this.ctx.logger.error('[indexer] 未注册的站点处理器 %s（见 src/sites/index.ts）', source.siteHandler)
+      // cordis DI 分派：站点处理器由项目插件 ctx.provide('site.<id>', handler) 注册
+      const h = source.siteHandler ? this.ctx.get('site.' + source.siteHandler) : undefined
+      if (!h || typeof (h as any).discover !== 'function') {
+        this.ctx.logger.error('[indexer] 未提供站点处理器 %s（项目需注册 cordis 服务 site.%s）', source.siteHandler, source.siteHandler)
         return []
       }
-      return h.discover(this.ctx, source)
+      return (h as SiteHandler).discover(this.ctx, source)
     }
     if (source.kind === 'static' || !source.indexRule) {
       return source.seedUrls

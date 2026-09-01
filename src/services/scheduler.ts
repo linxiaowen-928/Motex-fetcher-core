@@ -65,6 +65,7 @@ export class SchedulerService extends Service {
   private park: Job[] = []                 // 重入队等待区（延迟未到，尚未回流 queue 的任务）
   private visited = new Set<string>()          // 已抓/在抓/已放弃 的 url（去重）
   private failed = new Map<string, string>()   // 终局失败 url → 所属源（兜底重试轮要用）
+  private paused = false                        // 优雅暂停（manage API / pause flag 设置）：停止取新任务，批次尽快结算
   private running = 0
   private loopBusy = false
   private nextId = 0
@@ -138,6 +139,19 @@ export class SchedulerService extends Service {
     this.config.concurrency = Math.max(1, n)
     tlog({ ev: 'set_concurrency', n: this.config.concurrency })
     void this.loop()
+  }
+
+  /** 优雅暂停：停止取新任务，已派发任务继续跑完；未终局任务留队（由调用方 checkpoint 落盘） */
+  pause() {
+    this.paused = true
+    // 批次尽快结算：pending 承诺直接 resolve（在飞任务结束后 finishJob 对其已是 no-op）
+    for (const [, h] of this.pending) h.done()
+    this.pending.clear()
+    tlog({ ev: 'pause_set', queue: this.queue.length, running: this.running })
+  }
+
+  isPaused(): boolean {
+    return this.paused
   }
 
   /** 429/503 自适应：60s 内命中过多 → 临时降并发（恢复由心跳检查） */
@@ -221,6 +235,10 @@ export class SchedulerService extends Service {
     if (jobsLeft === 0) {
       this.pending.delete(id)
       resolveFn()
+    } else if (this.paused) {
+      // 已暂停：任务留在队里（下次恢复续跑），但批次立即结算——否则调用方 await push 会永久挂起
+      this.pending.delete(id)
+      resolveFn()
     }
     void this.loop()
     return p
@@ -233,6 +251,7 @@ export class SchedulerService extends Service {
     let lastStart = 0
     try {
       while (true) {
+        if (this.paused) break
         if (this.queue.length && this.running < this.config.concurrency) {
           const wait = this.config.delayMs - (Date.now() - lastStart)
           if (wait > 0) await sleep(wait)
@@ -367,9 +386,9 @@ export class SchedulerService extends Service {
     return items.length
   }
 
-  /** 断点：等待所有任务（含分页续推）完全落定后再返回（自检/收尾用） */
+  /** 断点：等待所有任务（含分页续推）完全落定后再返回（自检/收尾用）；暂停后立即返回 */
   async waitIdle() {
-    while (this.queue.length || this.running || this.park.length || this.pending.size) {
+    while (!this.paused && (this.queue.length || this.running || this.park.length || this.pending.size)) {
       await sleep(100)
     }
   }

@@ -4,12 +4,19 @@
  * 稳定性：SIGINT/SIGTERM 时自动 checkpoint（队列/已访问/失败快照），下次启动续跑；
  * 自检模式：注入假客户端，验证 并发/重试/重入队/去重/失败清单/索引发现(实例化) 全链路（无需网络）。
  *
- * 用法：
- *   node --experimental-strip-types src/index.ts [--config <json>]   # 正式（按源抓取）
- *   node --experimental-strip-types src/index.ts --self-test         # 自检
+ * 用法（CLI）：
+ *   node --experimental-strip-types src/cli.ts [--config <json>]   # 正式（按源抓取）
+ *   node --experimental-strip-types src/cli.ts --self-test         # 自检
+ *   node --experimental-strip-types src/cli.ts --cordis app.cordis.yml  # cordis 声明式装配（推荐，见 examples/）
+ *
+ * 用法（库）：
+ *   createApp(cfg, opts)          —— 独立 Context 上装配核心服务（可替换服务/插件/钩子）
+ *   assembleApp(ctx, cfg, opts)   —— 在【现有】cordis Context 上装配（fetcher 插件内部用，站点插件同树共享 DI）
+ *   runPhase(app, cfg, opts)      —— 两阶段执行（索引发现 → 爬取落盘 → 兜底重试）
+ *   fetcherPlugin                 —— cordis 插件形式（src/fetcher.ts），配合 loader.ts 的 cordis.yml 使用
  */
 import { Context } from '@deepseek-ai/cordis'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { join, resolve } from 'node:path'
@@ -20,7 +27,11 @@ import { IndexerService } from './services/indexer.ts' // re-export 见下方
 import { ParserService } from './services/parser.ts'
 import { StorageService } from './services/storage.ts'
 import { pipelinePlugin } from './plugins/pipeline.ts'
-import { registerSiteHandler } from './discovery/registry.ts'
+
+// 站点插件常用工具与类型（经 'motex-fetcher-core' 直接导入）
+export { extractLinks, decodeBytes, extractWithSelectors, detectNextPage } from './rules.ts'
+export type { SiteHandler } from './types.ts'
+
 import { runUpdate } from './discovery/update.ts'
 import { freshLogFile, setTraceFile, tlog } from './trace.ts'
 
@@ -44,41 +55,40 @@ export interface FetchCoreOptions {
   afterServices?: (ctx: Context, cfg: FetcherConfig) => void
 }
 
-/** 装配核心上下文（可替换服务/注册插件/钩子魔改），返回 cordis Context 供使用方自由扩展 */
-export function createApp(cfg: FetcherConfig, opts: FetchCoreOptions = {}): Context {
-  const app = new Context()
-  opts.beforeServices?.(app, cfg)
+/** 在【给定】cordis 上下文上装配核心服务（可替换服务/注册插件/钩子魔改），返回同一 ctx。
+ *  用途：fetcher 插件把服务装到 loader 的 ctx 树上，与站点插件共享 DI/事件（站点经 ctx.get('site.<id>') 被 indexer 分派）。 */
+export function assembleApp(ctx: Context, cfg: FetcherConfig, opts: FetchCoreOptions = {}): Context {
+  opts.beforeServices?.(ctx, cfg)
   const S = opts.services?.scheduler ?? SchedulerService
-  new S(app, cfg.scheduler)
+  new S(ctx, cfg.scheduler)
   const I = opts.services?.indexer ?? IndexerService
-  new I(app)
+  new I(ctx)
   const P = opts.services?.parser ?? ParserService
-  new P(app)
+  new P(ctx)
   const St = opts.services?.storage ?? StorageService
-  new St(app, cfg.storage)
-  app.plugin(pipelinePlugin, cfg)
-  for (const p of opts.plugins ?? []) app.plugin(p, cfg)
-  opts.afterServices?.(app, cfg)
-  return app
+  new St(ctx, cfg.storage)
+  ctx.plugin(pipelinePlugin, cfg)
+  for (const p of opts.plugins ?? []) ctx.plugin(p, cfg)
+  opts.afterServices?.(ctx, cfg)
+  return ctx
 }
-export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
-  const args = argv ?? process.argv.slice(2)
-  const selfTest = args.includes('--self-test')
-  const configPath = parseConfigPath(args)
 
-  const cfg = loadConfig(configPath)
-  if (!cfg.sources.length && !selfTest) {
-    console.error('[motex-fetcher] 未配置 sources（--config <json> 或补 examples）')
-    process.exit(2)
-  }
-  if (selfTest) {
-    // ⚠️ 自检必须与生产数据彻底隔离：独立输出/断点目录（必须在服务构造【之前】改配置，血的教训）
-    cfg.storage.outDir = 'out-selftest'
-    cfg.scheduler.stateFile = 'state-selftest/run.json'
-    cfg.indexFile = 'pool-selftest/index.jsonl'
-  }
+/** 独立 cordis 根上下文上装配核心服务（等价 assembleApp(new Context(), ...)），返回 Context 供使用方自由扩展 */
+export function createApp(cfg: FetcherConfig, opts: FetchCoreOptions = {}): Context {
+  return assembleApp(new Context(), cfg, opts)
+}
 
-  if (selfTest && !cfg.sources.length) {
+/** 自检准备（main 与 fetcher 插件共用）：目录隔离 + 假站点源注入 + 清理上次残留。
+ *  ⚠️ 必须在服务装配【之前】调用（血的教训：服务构造时读取 outDir/stateFile）。 */
+export function prepareSelfTest(cfg: FetcherConfig) {
+  cfg.storage.outDir = 'out-selftest'
+  cfg.scheduler.stateFile = 'state-selftest/run.json'
+  cfg.indexFile = 'pool-selftest/index.jsonl'
+  // 清理上次自检残留（防断言被旧产物污染：pgJoined 要求恰好 1 行、fails 条数精确等）
+  for (const dir of ['out-selftest', 'state-selftest', 'pool-selftest']) {
+    try { rmSync(join(process.cwd(), dir), { recursive: true, force: true }) } catch { /* 不存在则忽略 */ }
+  }
+  if (!cfg.sources.length) {
     cfg.sources = [
       { id: 'selftest', kind: 'static', seedUrls: [
         'https://fake.local/a', 'https://fake.local/b', 'https://fake.local/c',
@@ -118,32 +128,25 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
       },
     ]
   }
+}
 
-  if (selfTest) {
-    // 假站点处理器：模拟“发现 3 本 → 关键字过滤掉 1 本”
-    registerSiteHandler({
-      id: 'selftest-site',
-      discover: async (_ctx, source) => {
-        const kws = source.filterKeywords ?? []
-        const found = [
-          { url: 'https://fake.local/n1', title: '正常小说标题' },
-          { url: 'https://fake.local/n2', title: '含有禁词的小说标题' },
-          { url: 'https://fake.local/n3', title: '另一本正常小说' },
-        ]
-        return found.filter((n) => !kws.some((k) => n.title.includes(k))).map((n) => n.url)
-      },
-    })
-  }
+/** runPhase 参数（CLI 解析出的 --phase/--limit/--concurrency 与 fetcher 插件配置共用） */
+export interface RunPhaseOptions {
+  phase?: 'index' | 'crawl' | 'both' | 'update'
+  limit?: number
+  concurrency?: number
+  selfTest?: boolean
+}
 
-  // 根上下文：注册全部服务（作用域 DI：服务挂到 ctx 上按名注入）
-  // createApp 暴露 cordis 装配能力：服务可替换 / 插件可注册 / 前后钩子可魔改
-  const app = createApp(cfg, opts)
+/** 两阶段执行（CLI main 与 fetcher 插件共用）：索引发现 → 爬取落盘 → 兜底重试 → (自检断言)。
+ *  优雅暂停（state/pause_crawls.flag）：checkpoint 落盘后干净返回 { paused: true }，由调用方决定退出方式。 */
+export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseOptions = {}): Promise<{ paused: boolean }> {
+  const selfTest = opts.selfTest ?? false
 
   // ===== 两阶段模式（前置声明：自检/恢复分支也要用） =====
   const indexFile = cfg.indexFile ?? 'pool/index.jsonl'
-  const argPhase = getArg(args, '--phase')
-  const phase = (argPhase ?? cfg.phase ?? 'both') as 'index' | 'crawl' | 'both' | 'update'
-  const limit = Number(getArg(args, '--limit') ?? '0') || 0
+  const phase = (opts.phase ?? cfg.phase ?? 'both') as 'index' | 'crawl' | 'both' | 'update'
+  const limit = opts.limit ?? 0
   if (phase === 'index' || phase === 'both') {
     app.indexer.beginIndex(indexFile)         // 开索引池：处理器逐条 pushIndex 落盘
   }
@@ -152,7 +155,7 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
   setTraceFile(join(process.cwd(), 'state', `${sid}.log`))
   freshLogFile()
   tlog({ ev: 'start', phase, sources: cfg.sources.map((s) => s.id), limit })
-  const wantConc = Number(getArg(args, '--concurrency') ?? '0') || 0
+  const wantConc = opts.concurrency ?? 0
   if (wantConc > 0) app.scheduler.setConcurrency(wantConc)
 
   if (selfTest) {
@@ -229,9 +232,10 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
   // ===== 优雅暂停（crawl_ctl.py 管理）：检测 state/pause_crawls.flag → checkpoint 落盘 → 干净退出 =====
   // 不依赖外部信号（Windows 无 SIGTERM 投递），crawler 自检标记文件，5s 内响应。
   // index 阶段（BFS）同样响应：BFS 幂等 + pool 已落盘，直接退出无损。
+  // 注意：先 checkpoint 再置 paused（外部观察到暂停时快照必然已写）；selfTest 不注册（避免定时器挂住进程）。
   const pauseFile = join(process.cwd(), 'state', 'pause_crawls.flag')
-  // 注意：selfTest 模式不注册（否则完成后定时器挂着进程不退出，自检会"假卡死"）
-  const pauseIv = !selfTest ? setInterval(async () => {
+  let paused = false
+  const pauseIv: ReturnType<typeof setInterval> | null = !selfTest ? setInterval(async () => {
     try {
       if (existsSync(pauseFile)) {
         clearInterval(pauseIv)
@@ -241,14 +245,16 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
         } catch (e) {
           tlog({ ev: 'pause_checkpoint_err', err: String(e).slice(0, 80) })
         }
+        paused = true
+        app.scheduler.pause()
         tlog({ ev: 'paused_clean', ok: app.scheduler.stats.ok, failed: app.scheduler.stats.failed, requeued: app.scheduler.stats.requeued })
-        process.exit(0)
       }
     } catch { /* 检测失败不阻塞主流程 */ }
   }, 5000).unref() : null
 
   if (phase !== 'crawl') {
     for (const source of cfg.sources) {
+      if (paused) break
       app.logger.info('处理源 %s (kind=%s)：建索引…', source.id, source.kind)
       const urls = await app.indexer.discover(source)
       app.logger.info('源 %s：待抓 %d 个 URL', source.id, urls.length)
@@ -258,9 +264,9 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
   }
 
   if (phase !== 'index') {
-    // 爬取进度里程碑 → 聊天室（每 2500 条成功公告一次；完成时公告总账）
+    // 爬取进度里程碑（每 2500 条成功公告一次；完成时公告总账）
     let lastAnn = 0
-    const iv = !selfTest
+    const iv: ReturnType<typeof setInterval> | null = !selfTest
       ? setInterval(() => {
           const st = app.scheduler.stats
           if (st.ok - lastAnn >= 2500) {
@@ -274,7 +280,7 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
       if (phase === 'update') {
         // 追更：连载小说增量（回访详情 → diff 新章节 → 增量抓取，不动旧章节）
         const src0 = cfg.sources[0]
-        const upConc = Number(getArg(args, '--concurrency') || 0) || 2
+        const upConc = opts.concurrency || 2
         const added = await runUpdate(app, src0, indexFile, upConc, 1500)
         app.logger.info('追更完成：派发新章节 %d', added)
         tlog({ ev: 'update_plan', added })
@@ -361,16 +367,18 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
           await app.scheduler.push(urls, sid, 0)
         }
       }
-      await app.scheduler.waitIdle()     // 全部落定（含分页续推）
+      await app.scheduler.waitIdle()     // 全部落定（含分页续推）；暂停后立即返回
       tlog({ ev: 'crawl_main_done', ok: s.ok, failed: s.failed, requeued: s.requeued, skipped: s.skipped })
-      // 兜底重试轮：终局失败不能直接放弃（用户要求）
-      const retryPasses = cfg.scheduler.failRetryPasses ?? 1
-      for (let i = 0; i < retryPasses; i++) {
-        const n = await app.scheduler.retryFailedPass()
-        if (!n) break
-        await app.scheduler.waitIdle()
-        app.logger.warn('兜底重试第 %d 轮完成（重试 %d 个）', i + 1, n)
-        tlog({ ev: 'crawl_retry_done', pass: i + 1, n })
+      // 兜底重试轮：终局失败不能直接放弃（用户要求）；已暂停则跳过（checkpoint 已含失败清单，恢复后再跑）
+      if (!paused) {
+        const retryPasses = cfg.scheduler.failRetryPasses ?? 1
+        for (let i = 0; i < retryPasses; i++) {
+          const n = await app.scheduler.retryFailedPass()
+          if (!n) break
+          await app.scheduler.waitIdle()
+          app.logger.warn('兜底重试第 %d 轮完成（重试 %d 个）', i + 1, n)
+          tlog({ ev: 'crawl_retry_done', pass: i + 1, n })
+        }
       }
     } finally {
       if (iv) clearInterval(iv)
@@ -407,6 +415,53 @@ export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
   } else {
     console.log(`[motex-fetcher] 完成：成功 ${s.ok} / 终局失败 ${s.failed} / 重入队 ${s.requeued} / 去重跳过 ${s.skipped}（${secs}s）`)
   }
+  return { paused }
+}
+
+export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
+  const args = argv ?? process.argv.slice(2)
+  const selfTest = args.includes('--self-test')
+  const configPath = parseConfigPath(args)
+
+  const cfg = loadConfig(configPath)
+  if (!cfg.sources.length && !selfTest) {
+    console.error('[motex-fetcher] 未配置 sources（--config <json> 或补 examples）')
+    process.exit(2)
+  }
+  if (selfTest) prepareSelfTest(cfg)
+
+  // 根上下文：注册全部服务（作用域 DI：服务挂到 ctx 上按名注入）
+  // createApp 暴露 cordis 装配能力：服务可替换 / 插件可注册 / 前后钩子可魔改
+  const app = createApp(cfg, {
+    ...opts,
+    beforeServices: (ctx, c) => {
+      opts.beforeServices?.(ctx, c)
+      if (selfTest) {
+        // 假站点处理器：模拟“发现 3 本 → 关键字过滤掉 1 本”（cordis 服务方式注册，经 DI 被 indexer 分派）
+        ctx.provide('site.selftest-site', {
+          id: 'selftest-site',
+          discover: async (_ctx, source) => {
+            const kws = source.filterKeywords ?? []
+            const found = [
+              { url: 'https://fake.local/n1', title: '正常小说标题' },
+              { url: 'https://fake.local/n2', title: '含有禁词的小说标题' },
+              { url: 'https://fake.local/n3', title: '另一本正常小说' },
+            ]
+            return found.filter((n) => !kws.some((k) => n.title.includes(k))).map((n) => n.url)
+          },
+        })
+      }
+    },
+  })
+
+  const result = await runPhase(app, cfg, {
+    phase: (getArg(args, '--phase') ?? cfg.phase ?? 'both') as 'index' | 'crawl' | 'both' | 'update',
+    limit: Number(getArg(args, '--limit') ?? '0') || 0,
+    concurrency: Number(getArg(args, '--concurrency') ?? '0') || 0,
+    selfTest,
+  })
+  // 暂停 = 干净结束（checkpoint 已落盘）：立即退出，不等待残余定时器
+  if (result.paused) process.exit(0)
 }
 
 function readOutputLines(cfg: FetcherConfig, name: string): string[] {

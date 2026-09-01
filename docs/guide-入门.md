@@ -73,14 +73,28 @@
 }
 ```
 
-## 五、跑起来（两种方式）
+## 五、跑起来（三种方式）
 
-**方式 A：CLI（不写代码）**
+**方式 A：cordis.yml 声明式装配（推荐，DSH 同款格式）**
+```yaml
+# app.cordis.yml —— 顶层是 YAML 数组，顺序即应用顺序
+- id: fetcher
+  name: 'cordis:fetcher'        # 核心抓取器插件
+  config:
+    config: './config.json'     # 上面的抓取器配置
+    phase: 'both'
+```
 ```bash
-node --experimental-strip-types core/src/cli.ts --config ./config.json --phase both
+node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --cordis app.cordis.yml
+```
+> 站点插件（见《扩展开发指南》）也以同样方式列进来，排在 fetcher 之前即可。
+
+**方式 B：CLI（不写代码，简单场景）**
+```bash
+node --experimental-strip-types node_modules/motex-fetcher-core/src/cli.ts --config ./config.json --phase both
 ```
 
-**方式 B：作为库（适合要扩展的时候）**
+**方式 C：作为库（适合要扩展的时候）**
 ```ts
 // run.ts
 import './my-handler.ts'                    // 注册你的站点（可选）

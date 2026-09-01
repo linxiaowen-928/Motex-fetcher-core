@@ -13,7 +13,8 @@ import type { FetchResponse } from '../types.ts'
 
 export const pipelinePlugin = {
   name: 'pipeline',
-  inject: ['scheduler', 'indexer', 'parser', 'storage'],
+  // 注意：不能声明 inject——cordis v4 在 active fiber 内 ctx.plugin() 带 inject 的插件会延迟到父 fiber 结束才 apply（fetcher 插件内装配会错过整个爬取期）；
+  // 服务经 ctx.storage 等惰性解析（assembleApp 已先构造服务，事件触发时必然可用）。
 
   apply(ctx: Context, cfg: FetcherConfig) {
     // 终局失败 → 失败清单落盘（稳定性的可见性保证）

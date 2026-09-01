@@ -1,0 +1,55 @@
+{
+  "sources": [
+    {
+      "id": "selftest",
+      "kind": "static",
+      "seedUrls": [
+        "https://fake.local/a",
+        "https://fake.local/b",
+        "https://fake.local/c",
+        "https://fake.local/retry-me",
+        "https://fake.local/perm-404",
+        "https://fake.local/perm-404"
+      ]
+    },
+    {
+      "id": "selftest-cat",
+      "kind": "index",
+      "seedUrls": ["https://fake.local/catalog"],
+      "indexRule": { "linkRegex": "href=\"(https://fake\\.local/page\\d+\\.html)\"" },
+      "parseRule": {
+        "encoding": "utf-8",
+        "bodyStart": "<div id=\"content\">",
+        "bodyEnd": "</div>",
+        "adLineRegex": ["www\\.", "广告"],
+        "minLen": 40
+      }
+    },
+    {
+      "id": "selftest-site",
+      "kind": "site",
+      "siteHandler": "selftest-site",
+      "seedUrls": [],
+      "filterKeywords": ["禁词"],
+      "parseRule": { "encoding": "utf-8", "section": "#body", "contentSelector": ".txt", "minLen": 40 }
+    },
+    {
+      "id": "selftest-pg",
+      "kind": "static",
+      "seedUrls": ["https://fake.local/pg.html"],
+      "parseRule": {
+        "encoding": "utf-8",
+        "section": "#wznr",
+        "contentSelector": ".ttnr",
+        "followPagination": true,
+        "minLen": 10
+      }
+    },
+    {
+      "id": "selftest-raw",
+      "kind": "static",
+      "downloadRaw": true,
+      "seedUrls": ["https://fake.local/audio/sample.wav"]
+    }
+  ]
+}

@@ -6,6 +6,7 @@
  * 各组件之间不直接互相 new，只通过 ctx 上注册的服务与事件协作。
  */
 import type { Context } from '@deepseek-ai/cordis'
+import type { SourceConfig } from './config.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -73,4 +74,10 @@ export interface ParsedItem {
   text: string
   title?: string
   meta?: Record<string, unknown>
+}
+
+/** 站点处理器契约：项目插件通过 ctx.provide('site.<id>', handler) 注册，indexer 经 cordis DI 分派 */
+export interface SiteHandler {
+  id: string
+  discover(ctx: Context, source: SourceConfig): Promise<string[]>
 }
