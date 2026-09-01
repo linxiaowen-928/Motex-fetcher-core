@@ -1,0 +1,9 @@
+﻿node_modules/
+*.log
+state/
+out/
+pool/
+data_audio/
+out-selftest/
+state-selftest/
+pool-selftest/

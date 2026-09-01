@@ -1,0 +1,15 @@
+﻿{
+  "name": "motex-fetcher-core",
+  "version": "0.1.0",
+  "description": "通用抓取框架核心（两阶段 index→crawl、调度/重试/断点、二进制下载、BFS 发现）——各项目扩展接入",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "self-test": "node --experimental-strip-types src/index.ts --self-test"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "cheerio": "^1.0.0"
+  },
+  "license": "MIT"
+}
