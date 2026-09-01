@@ -74,10 +74,30 @@ export interface StorageConfig {
   stripNewlines?: boolean
 }
 
+/** 管理服务任务描述（缺省 = 当前 config 的 sources 自动生成） */
+export interface ManageTask {
+  id: string
+  /** 输出文件路径（状态判断：最后写入时间） */
+  outFile?: string
+  /** tlog 日志路径（心跳/进度） */
+  logFile?: string
+}
+
+/** 轻量管理服务（可选开启）：纯 API 或 API+Web 页面，管理暂停/恢复与状态查看 */
+export interface ManageConfig {
+  enabled?: boolean     // 总开关（默认 false）
+  port?: number         // 监听端口（默认 8787）
+  api?: boolean         // 纯 API 路线（默认 true）
+  web?: boolean         // 轻量 Web 页面（默认 true；api 需同时为 true 页面才能工作）
+  tasks?: ManageTask[]  // 要管理的任务（缺省 = 当前 config 的 sources）
+}
+
 export interface FetcherConfig {
   sources: SourceConfig[]
   scheduler: SchedulerConfig
   storage: StorageConfig
+  /** 管理服务（可选；默认关闭） */
+  manage?: ManageConfig
   /** 运行阶段：index=只建索引池；crawl=只从池爬正文；both=两者（默认） */
   phase?: 'index' | 'crawl' | 'both'
   /** 索引池 JSONL 文件（phase=index/crawl 时使用；相对运行目录） */

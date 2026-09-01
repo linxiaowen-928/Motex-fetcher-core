@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Motex-fetcher-core 管理台</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; padding: 0 16px; background: #fafafa; color: #222; }
+  h1 { font-size: 20px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin: 14px 0; }
+  button { padding: 7px 16px; border: 0; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  #pauseBtn { background: #d9534f; color: #fff; }
+  #resumeBtn { background: #5cb85c; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e3e3e3; border-radius: 8px; overflow: hidden; }
+  th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid #eee; font-size: 14px; }
+  th { background: #f3f3f3; font-weight: 600; }
+  .tag { display: inline-block; padding: 2px 9px; border-radius: 10px; font-size: 12px; }
+  .run { background: #dff0d8; color: #3c763d; }
+  .pause { background: #fcf8e3; color: #8a6d3b; }
+  .dead { background: #f2dede; color: #a94442; }
+  .note { color: #888; font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<h1>🕸️ Motex-fetcher-core 管理台</h1>
+<div class="bar">
+  <button id="pauseBtn">⏸ 暂停全部</button>
+  <button id="resumeBtn">▶ 恢复</button>
+  <span id="state" style="font-size:13px;color:#666"></span>
+</div>
+<table>
+  <thead><tr><th>任务</th><th>状态</th><th>输出</th><th>心跳</th><th>最近写入</th></tr></thead>
+  <tbody id="rows"><tr><td colspan="5" style="color:#999">加载中…</td></tr></tbody>
+</table>
+<div class="note">新增 crawl 实例的图形化入口：接口已预留（POST /api/instances），后续版本开放。</div>
+<script>
+const $ = (s) => document.querySelector(s);
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    $('#state').textContent = d.paused ? '⏸ 全局暂停中' : '运行中';
+    $('#pauseBtn').disabled = d.paused;
+    $('#resumeBtn').disabled = !d.paused;
+    $('#rows').innerHTML = d.tasks.map((t) => {
+      const st = t.paused ? '<span class="tag pause">暂停</span>'
+        : t.alive ? '<span class="tag run">运行</span>'
+        : '<span class="tag dead">停更</span>';
+      const age = t.outAgeSec == null ? '-' : t.outAgeSec + 's';
+      const size = t.outMB == null ? '-' : t.outMB + 'MB';
+      return `<tr><td>${t.id}</td><td>${st}</td><td>${size}</td><td>${t.heartbeat ?? '-'}</td><td>${age}</td></tr>`;
+    }).join('');
+  } catch (e) { $('#rows').innerHTML = '<tr><td colspan="5" style="color:#a94442">无法连接管理服务</td></tr>'; }
+}
+$('#pauseBtn').onclick = async () => { await fetch('/api/pause', { method: 'POST' }); refresh(); };
+$('#resumeBtn').onclick = async () => { await fetch('/api/resume', { method: 'POST' }); refresh(); };
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

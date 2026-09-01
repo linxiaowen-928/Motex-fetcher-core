@@ -66,6 +66,20 @@ src/
 └── download_worker.ts    # 大文件下载 worker（独立进程）
 ```
 
+
+## 管理服务（可选）
+
+```jsonc
+{ "manage": { "enabled": true, "port": 8787, "api": true, "web": true } }
+```
+
+- `GET /api/status` 任务状态（输出/心跳/暂停态）
+- `POST /api/pause` 优雅暂停（写 pause flag → checkpoint 干净退出）
+- `POST /api/resume` 恢复（看护自动拉起）
+- `GET /` 轻量 Web 管理页（`web: true` 时）
+- `POST /api/instances` 图形化新增实例入口（接口预留，未实现）
+
+默认关闭（不配 `manage` 即不启动）。
 ## 许可
 
 MIT

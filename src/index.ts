@@ -184,6 +184,12 @@ async function main() {
     }
   }
 
+  // 管理服务（可选开启，默认关闭）
+  if (cfg.manage?.enabled) {
+    const { startManageServer } = await import('./services/manage.ts')
+    startManageServer(cfg)
+  }
+
   const t0 = Date.now()
   let total = 0
   const pool: { url: string; source: string }[] = []
