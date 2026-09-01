@@ -137,3 +137,76 @@ crawl_ctl 或管理服务 → 写 state/pause_crawls.flag
 5. **断点是资产**：`state/`、`pool/`、`out/` 都是可恢复资产，别随手删
 
 **下一步**：读《架构说明》（调度器内部/断点格式/事件日志）。
+
+## 八、自由扩展（cordis 能力——不再黑盒）
+
+核心内部基于 `@deepseek-ai/cordis`（DI 容器 + 事件 + 插件）。通过 `main(argv, opts)` / `createApp(cfg, opts)` 把这些能力暴露给使用方。
+
+### 1. 自定义插件（监听事件）
+
+```ts
+import { main } from './core/src/index.ts'
+
+await main(['--config', './config.json'], {
+  plugins: [{
+    name: 'my-stats',
+    apply(ctx) {
+      ctx.on('fetch/parsed', (res, item) => { /* 每条落盘前：统计/入库/转发 */ })
+      ctx.on('fetch/failed', (res) => { /* 失败告警 */ })
+    },
+  }],
+})
+```
+
+### 2. 装配钩子（任意魔改）
+
+```ts
+await main(['--config', './config.json'], {
+  beforeServices(ctx) { /* 服务装配前：注册自己的服务/中间件 */ },
+  afterServices(ctx) {
+    // 例：覆盖网络客户端（自定义抓取逻辑/代理/伪装）
+    ctx.scheduler.client = async (url: string, timeoutMs: number) => {
+      // 自己的 fetch 逻辑（可加 UA/代理/重试策略）
+      const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+      return { status: r.status, ok: r.ok, body: new Uint8Array(await r.arrayBuffer()) }
+    }
+  },
+})
+```
+
+### 3. 替换核心服务（继承默认类魔改）
+
+```ts
+import { createApp, SchedulerService } from './core/src/index.ts'
+import { loadConfig } from './core/src/config.ts'
+
+class MyScheduler extends SchedulerService {
+  // 魔改：例如自定义 429 策略 / 额外统计
+  protected override noticeLimited(now: number) { /* ... */ }
+}
+
+const cfg = loadConfig('./config.json')
+const app = createApp(cfg, {
+  services: { scheduler: MyScheduler },   // 换掉调度器，其余默认
+})
+// app 就是 cordis Context——之后想怎么玩怎么玩（直接 push/监听/自己跑阶段）
+```
+
+### 4. 只拿 app 自己玩（不跑两阶段）
+
+```ts
+import { createApp } from './core/src/index.ts'
+import { loadConfig } from './core/src/config.ts'
+
+const app = createApp(loadConfig('./config.json'))
+await app.scheduler.push(['https://example.com/a'], 'demo', 0)  // 直接用调度器
+app.scheduler.waitIdle()                                        // 等完成
+// 落盘逻辑在 pipeline 插件里（fetch/response → parse → storage）
+```
+
+### 原则
+
+- **默认装配** = 开箱即用（两阶段管线）
+- **opts** = 打开 cordis 的任意扩展面（DI 替换 / 事件 / 插件）
+- **createApp 返回的 Context** = 完整 cordis 上下文，可自由注入/监听/扩展
+- 想替换什么就替换什么，不想替换就全默认——**自由度在你手里**
