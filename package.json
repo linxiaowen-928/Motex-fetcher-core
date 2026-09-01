@@ -2,6 +2,7 @@
     "scripts":  {
                     "self-test-cordis":  "node --experimental-strip-types src/cli.ts --cordis examples/selftest.cordis.yml",
                     "self-test-hmr":  "node test/hmr-test.mjs",
+                    "capability-check":  "node --experimental-strip-types test/capability-check.ts",
                     "self-test":  "node --experimental-strip-types src/cli.ts --self-test"
                 },
     "description":  "通用抓取框架核心（两阶段 index→crawl、调度/重试/断点、二进制下载、BFS 发现、可选管理服务、cordis.yml 组合与热更新）——各项目扩展接入",
