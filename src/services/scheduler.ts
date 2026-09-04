@@ -170,6 +170,32 @@ export class SchedulerService extends Service {
    *  池内全部失败 → 抛错交还调度器重试/重入队（【绝不直连兜底】，保全单 IP 不被盾）。
    *  未配置 proxyPool 时 = 直连（常规单出口模式）。
    *  【留桩】浏览器伪装/UA 指纹等在正式源接入时注入。 */
+  /** 带硬超时的单次请求（2026-09-05）：TUN 挂起时 abort 不生效 → race 必败承诺兜底。
+   *  ⚠️ 硬超时 timer 不能 unref：全进程 timer 都 unref 时事件循环空转，unref timer 不触发，
+   *     硬超时会失效（挂死依旧）。ref timer 在请求正常完成后 clearTimeout 清理。 */
+  private async fetchHard(url: string, timeoutMs: number, ctrl: AbortController, dispatcher?: any) {
+    let hard: ReturnType<typeof setTimeout> | null = null
+    const hardP = new Promise<never>((_, rej) => {
+      hard = setTimeout(
+        () => rej(new Error(`request hard-timeout ${timeoutMs}ms: ${url.slice(0, 90)}`)),
+        timeoutMs + 3000)
+    })
+    try {
+      if (dispatcher) {
+        return await Promise.race([
+          ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow' }),
+          hardP,
+        ])
+      }
+      return await Promise.race([
+        fetch(url, { signal: ctrl.signal, redirect: 'follow' }),
+        hardP,
+      ])
+    } finally {
+      if (hard) clearTimeout(hard)
+    }
+  }
+
   private async defaultClient(url: string, timeoutMs: number) {
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), timeoutMs)
@@ -184,7 +210,7 @@ export class SchedulerService extends Service {
             const dispatcher: any = p.startsWith('socks')
               ? new SocksProxyAgent(p, { timeout: this.config.timeoutMs })
               : new ProxyAgent(p)
-            const res = await ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow' })
+            const res = await this.fetchHard(url, timeoutMs, ctrl, dispatcher)
             const body = res.ok ? new Uint8Array(await res.arrayBuffer()) : null
             return { status: res.status, ok: res.ok, body }   // 连接成功即返回（4xx/5xx 交给调度器决策）
           } catch (e) {
@@ -195,7 +221,7 @@ export class SchedulerService extends Service {
         // 池内尝试全部失败：抛错 → 调度器重试/重入队（不直连）
         throw new Error(`proxy pool exhausted: ${url}`)
       }
-      const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow' })
+      const res = await this.fetchHard(url, timeoutMs, ctrl)
       const body = res.ok ? new Uint8Array(await res.arrayBuffer()) : null
       return { status: res.status, ok: res.ok, body }
     } finally {
