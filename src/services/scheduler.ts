@@ -246,22 +246,27 @@ export class SchedulerService extends Service {
 
   /** curl 模式 client：spawn curl.exe（schannel TLS 指纹——指纹风控站放行 curl 拒 node/python）。
    *  -f：4xx/5xx 视为失败（退出码非 0 → 抛错交调度器重试，近似瞬时失败）
-   *  -e 同域 referer；输出经 pipe 捕获（maxBuffer 128MB 防大文件截断） */
+   *  -e 同域 referer；proxyPool 配置时经 rotator 轮换代理出口（IP 限速站换 IP 绕过）——
+   *  失败/空响应 → reportBad 冷却该代理。输出经 pipe 捕获（maxBuffer 128MB 防大文件截断） */
   private curlClient(url: string, timeoutMs: number): Promise<{ status: number; ok: boolean; body: Uint8Array | null }> {
     return new Promise((resolve, reject) => {
-      execFile('curl.exe', [
+      const proxy = this.rotator ? this.rotator.next() : null
+      const args = [
         '-sL', '-f', '--max-time', String(Math.ceil(timeoutMs / 1000) + 5),
         '-A', SchedulerService.UA,
         '-e', new URL(url).origin + '/',
-        url,
-      ], { maxBuffer: 128 * 1024 * 1024, encoding: 'buffer', windowsHide: true },
-      (err, stdout) => {
-        if (err) {
-          reject(new Error(`curl 失败: ${String(err).slice(0, 100)}`))
-          return
-        }
-        resolve({ status: 200, ok: true, body: new Uint8Array(stdout as Buffer) })
-      })
+      ]
+      if (proxy) args.push('-x', proxy)
+      args.push(url)
+      execFile('curl.exe', args, { maxBuffer: 128 * 1024 * 1024, encoding: 'buffer', windowsHide: true },
+        (err, stdout) => {
+          if (err || !stdout || stdout.length === 0) {
+            if (proxy) this.rotator?.reportBad(proxy)
+            reject(new Error(`curl 失败: ${String(err ?? '空响应').slice(0, 100)}`))
+            return
+          }
+          resolve({ status: 200, ok: true, body: new Uint8Array(stdout as Buffer) })
+        })
     })
   }
 
