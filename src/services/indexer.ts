@@ -72,8 +72,10 @@ export class IndexerService extends Service {
     return [...out]
   }
 
-  /** 等待站点处理器注册（loader 并行 apply 竞态兜底：轮询最多 timeoutMs） */
-  private async waitSiteHandler(id: string | undefined, timeoutMs = 20_000): Promise<SiteHandler | null> {
+  /** 等待站点处理器注册（loader 并行 apply 竞态兜底：轮询最多 timeoutMs）
+   *  120s：站点插件冷加载可达 16-30s（strip-types 新进程全量编译 + 新文件），
+   *  20s 窗口会在慢 import 时超时空手（2026-09-05 目标限流站 index 空手根因） */
+  private async waitSiteHandler(id: string | undefined, timeoutMs = 120_000): Promise<SiteHandler | null> {
     const t0 = Date.now()
     while (Date.now() - t0 < timeoutMs) {
       try {
