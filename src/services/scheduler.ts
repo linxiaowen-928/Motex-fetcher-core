@@ -172,7 +172,10 @@ export class SchedulerService extends Service {
    *  【留桩】浏览器伪装/UA 指纹等在正式源接入时注入。 */
   /** 带硬超时的单次请求（2026-09-05）：TUN 挂起时 abort 不生效 → race 必败承诺兜底。
    *  ⚠️ 硬超时 timer 不能 unref：全进程 timer 都 unref 时事件循环空转，unref timer 不触发，
-   *     硬超时会失效（挂死依旧）。ref timer 在请求正常完成后 clearTimeout 清理。 */
+   *     硬超时会失效（挂死依旧）。ref timer 在请求正常完成后 clearTimeout 清理。
+   *  UA：默认带浏览器 UA（2026-09-05 目标限流站 站 444 反爬教训：无 UA 的 undici 请求被 nginx 直接断开） */
+  private static readonly UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
+
   private async fetchHard(url: string, timeoutMs: number, ctrl: AbortController, dispatcher?: any) {
     let hard: ReturnType<typeof setTimeout> | null = null
     const hardP = new Promise<never>((_, rej) => {
@@ -181,14 +184,17 @@ export class SchedulerService extends Service {
         timeoutMs + 3000)
     })
     try {
+      // connection: close —— 禁用 keep-alive 连接池复用（2026-09-05 目标限流站 站 444 教训：
+      // 服务端关闭的死连接被池复用 → nginx 直接 444；python urllib 每请求新连接全通对照验证）
+      const headers = { 'user-agent': SchedulerService.UA, connection: 'close' }
       if (dispatcher) {
         return await Promise.race([
-          ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow' }),
+          ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow', headers }),
           hardP,
         ])
       }
       return await Promise.race([
-        fetch(url, { signal: ctrl.signal, redirect: 'follow' }),
+        fetch(url, { signal: ctrl.signal, redirect: 'follow', headers }),
         hardP,
       ])
     } finally {
@@ -319,8 +325,9 @@ export class SchedulerService extends Service {
       }
       try {
         const r = await this.client(job.url, this.config.timeoutMs)
-        if (r.status === 429 || r.status === 503) {
-          this.noticeLimited(Date.now())      // 限流自适应（降并发/放慢）
+        if (r.status === 429 || r.status === 503 || r.status === 444) {
+          // 444 = nginx 无响应（目标限流站 等站反爬/死连接特征）：按限流处理——降并发 + 瞬时重试退避
+          this.noticeLimited(Date.now())
         }
         const res: FetchResponse = {
           url: job.url, source: job.source, status: r.status, ok: r.ok && r.body !== null,
@@ -329,8 +336,8 @@ export class SchedulerService extends Service {
           continuationOf: job.continuationOf ?? null,
         }
         if (res.ok) { outcome = { kind: 'ok', res }; break }
-        // 4xx（除 408/429）= 永久失败；其余(5xx/网络) = 瞬时
-        if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) {
+        // 4xx（除 408/429/444）= 永久失败；其余(5xx/网络/444) = 瞬时
+        if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429 && r.status !== 444) {
           outcome = { kind: 'permanent', res, err: `HTTP ${r.status}` }
           break
         }

@@ -92,6 +92,9 @@ export const fetcherPlugin = {
 /** 单源一轮（watch 热接入用）：发现 → 入队 → 落定。
  *  去重/重试/断点由调度器负责；进程常驻，visited 集合持续有效（重启后由 done.urls 兜底）。 */
 async function runSourceOnce(app: Context, cfg: FetcherConfig, src: SourceConfig) {
+  // 开索引池：discover 内 pushIndex 才能落盘（2026-09-05：漏开导致池不落盘，
+  // 重启后 seen 空 → 每轮全量重发现）
+  app.indexer.beginIndex(cfg.indexFile ?? `pool/${src.id}.index.jsonl`)
   const urls = await app.indexer.discover(src)
   if (!urls.length) {
     app.logger.info('[fetcher] 新源 %s：无 URL', src.id)
