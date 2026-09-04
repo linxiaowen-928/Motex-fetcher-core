@@ -210,6 +210,10 @@ export class SchedulerService extends Service {
   }
 
   private async defaultClient(url: string, timeoutMs: number) {
+    // curl 模式（TLS 指纹风控站）：spawn curl.exe（schannel 指纹放行；node/python OpenSSL 被拒）
+    if (this.config.curlMode) {
+      return this.curlClient(url, timeoutMs)
+    }
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), timeoutMs)
     try {
@@ -238,6 +242,27 @@ export class SchedulerService extends Service {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /** curl 模式 client：spawn curl.exe（schannel TLS 指纹——指纹风控站放行 curl 拒 node/python）。
+   *  -f：4xx/5xx 视为失败（退出码非 0 → 抛错交调度器重试，近似瞬时失败）
+   *  -e 同域 referer；输出经 pipe 捕获（maxBuffer 128MB 防大文件截断） */
+  private curlClient(url: string, timeoutMs: number): Promise<{ status: number; ok: boolean; body: Uint8Array | null }> {
+    return new Promise((resolve, reject) => {
+      execFile('curl.exe', [
+        '-sL', '-f', '--max-time', String(Math.ceil(timeoutMs / 1000) + 5),
+        '-A', SchedulerService.UA,
+        '-e', new URL(url).origin + '/',
+        url,
+      ], { maxBuffer: 128 * 1024 * 1024, encoding: 'buffer', windowsHide: true },
+      (err, stdout) => {
+        if (err) {
+          reject(new Error(`curl 失败: ${String(err).slice(0, 100)}`))
+          return
+        }
+        resolve({ status: 200, ok: true, body: new Uint8Array(stdout as Buffer) })
+      })
+    })
   }
 
   /** 入队一批 URL；返回的 Promise 在该批全部【终局】(成功/永久失败)后 resolve

@@ -65,6 +65,9 @@ export interface SchedulerConfig {
   timeoutMs: number
   /** 【留桩】代理（如 'http://user:pass@host:port'），需要时用 undici ProxyAgent 接入 */
   proxy?: string
+  /** curl 模式（2026-09-05 指纹风控站 教训）：TLS 指纹风控站拒绝 node/python 客户端但放行
+   *  curl（schannel）——true 时 client 改 spawn curl.exe 抓取（-f：4xx 视为失败） */
+  curlMode?: boolean
 }
 
 export interface StorageConfig {
