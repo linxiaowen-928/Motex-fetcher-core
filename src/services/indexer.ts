@@ -39,12 +39,14 @@ export class IndexerService extends Service {
   async discover(source: SourceConfig): Promise<string[]> {
     if (source.kind === 'site') {
       // cordis DI 分派：站点处理器由项目插件 ctx.provide('site.<id>', handler) 注册
-      const h = source.siteHandler ? this.ctx.get('site.' + source.siteHandler) : undefined
-      if (!h || typeof (h as any).discover !== 'function') {
+      // ⚠️ 装配竞态（2026-09-05 index 阶段暴露）：loader 并行 apply 条目——fetcher 的 runPhase
+      //    可能与站点插件的 provide 同时进行，discover 时 handler 可能还没注册 → 等它出现
+      const h = await this.waitSiteHandler(source.siteHandler)
+      if (!h) {
         this.ctx.logger.error('[indexer] 未提供站点处理器 %s（项目需注册 cordis 服务 site.%s）', source.siteHandler, source.siteHandler)
         return []
       }
-      return (h as SiteHandler).discover(this.ctx, source)
+      return h.discover(this.ctx, source)
     }
     if (source.kind === 'static' || !source.indexRule) {
       return source.seedUrls
@@ -68,5 +70,20 @@ export class IndexerService extends Service {
     }
     this.ctx.logger.info('[indexer] 源 %s：目录发现 %d 个 URL', source.id, out.size)
     return [...out]
+  }
+
+  /** 等待站点处理器注册（loader 并行 apply 竞态兜底：轮询最多 timeoutMs） */
+  private async waitSiteHandler(id: string | undefined, timeoutMs = 20_000): Promise<SiteHandler | null> {
+    const t0 = Date.now()
+    while (Date.now() - t0 < timeoutMs) {
+      try {
+        const h = this.ctx.get('site.' + id)
+        if (h && typeof (h as { discover?: unknown }).discover === 'function') {
+          return h as SiteHandler
+        }
+      } catch { /* 服务未注册 → 继续等 */ }
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    return null
   }
 }
