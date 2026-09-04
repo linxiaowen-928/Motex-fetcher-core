@@ -177,26 +177,27 @@ export class SchedulerService extends Service {
   private static readonly UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
 
   private async fetchHard(url: string, timeoutMs: number, ctrl: AbortController, dispatcher?: any) {
+    // connection: close —— 禁用 keep-alive 连接池复用（2026-09-05 目标限流站 站 444 教训：
+    // 服务端关闭的死连接被池复用 → nginx 直接 444；python urllib 每请求新连接全通对照验证）
+    const headers = { 'user-agent': SchedulerService.UA, connection: 'close' }
     let hard: ReturnType<typeof setTimeout> | null = null
     const hardP = new Promise<never>((_, rej) => {
       hard = setTimeout(
         () => rej(new Error(`request hard-timeout ${timeoutMs}ms: ${url.slice(0, 90)}`)),
         timeoutMs + 3000)
     })
+    // ⚠️ fetch + body 读取必须整体在 race 内（2026-09-05 目标限流站 index 卡死根因）：
+    //    TUN 挂起时响应头可达但 body 不来，res.arrayBuffer() 永久挂起——
+    //    只 race fetch() 管不到 body 阶段，硬超时形同虚设（连接 ESTABLISHED 空挂）。
+    const doFetch = async () => {
+      const res = dispatcher
+        ? await ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow', headers })
+        : await fetch(url, { signal: ctrl.signal, redirect: 'follow', headers })
+      const body = res.ok ? new Uint8Array(await res.arrayBuffer()) : null
+      return { status: res.status, ok: res.ok, body }
+    }
     try {
-      // connection: close —— 禁用 keep-alive 连接池复用（2026-09-05 目标限流站 站 444 教训：
-      // 服务端关闭的死连接被池复用 → nginx 直接 444；python urllib 每请求新连接全通对照验证）
-      const headers = { 'user-agent': SchedulerService.UA, connection: 'close' }
-      if (dispatcher) {
-        return await Promise.race([
-          ufetch(url, { dispatcher, signal: ctrl.signal, redirect: 'follow', headers }),
-          hardP,
-        ])
-      }
-      return await Promise.race([
-        fetch(url, { signal: ctrl.signal, redirect: 'follow', headers }),
-        hardP,
-      ])
+      return await Promise.race([doFetch(), hardP])
     } finally {
       if (hard) clearTimeout(hard)
     }
