@@ -39,7 +39,13 @@ export class ParserService extends Service {
     // ---- 详情页信号：解析章节链接并入队（此页面本身不入库；章节页再走正文提取） ----
     if (rule?.chapterSignal && html.includes(rule.chapterSignal)) {
       const $ = cheerio.load(html)
-      const prefix = rule.chapterLinkPrefix ?? ''
+      // 动态前缀（2026-09-05 多级目录站）：章链接前缀 = 当前页 URL 书 id 段（/{bookid}/{chid}.html）——
+      // 每书不同无法静态配置，chapterLinkPrefix='__self__' 时取 pathname 第一段（如 /103837）
+      let prefix = rule.chapterLinkPrefix ?? ''
+      if (prefix === '__self__') {
+        const seg = new URL(res.url).pathname.split('/').filter(Boolean)
+        prefix = '/' + (seg[0] ?? '')
+      }
       const urls: string[] = []
       const cur = new URL(res.url)
       $('a[href]').each((_, el) => {
