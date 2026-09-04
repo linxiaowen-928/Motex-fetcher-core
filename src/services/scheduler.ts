@@ -179,7 +179,13 @@ export class SchedulerService extends Service {
   private async fetchHard(url: string, timeoutMs: number, ctrl: AbortController, dispatcher?: any) {
     // connection: close —— 禁用 keep-alive 连接池复用（2026-09-05 目标限流站 站 444 教训：
     // 服务端关闭的死连接被池复用 → nginx 直接 444；python urllib 每请求新连接全通对照验证）
-    const headers = { 'user-agent': SchedulerService.UA, connection: 'close' }
+    // referer：同域 origin（2026-09-05 指纹风控站 教训：fiction 页无 referer 一律 403 防盗链——
+    // 模拟浏览器站内导航，全站通用无害）
+    const headers = {
+      'user-agent': SchedulerService.UA,
+      connection: 'close',
+      referer: new URL(url).origin + '/',
+    }
     let hard: ReturnType<typeof setTimeout> | null = null
     const hardP = new Promise<never>((_, rej) => {
       hard = setTimeout(
