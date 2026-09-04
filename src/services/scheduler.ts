@@ -218,8 +218,7 @@ export class SchedulerService extends Service {
               ? new SocksProxyAgent(p, { timeout: this.config.timeoutMs })
               : new ProxyAgent(p)
             const res = await this.fetchHard(url, timeoutMs, ctrl, dispatcher)
-            const body = res.ok ? new Uint8Array(await res.arrayBuffer()) : null
-            return { status: res.status, ok: res.ok, body }   // 连接成功即返回（4xx/5xx 交给调度器决策）
+            return { status: res.status, ok: res.ok, body: res.body }   // fetchHard 已读 body（勿 arrayBuffer）
           } catch (e) {
             this.rotator.reportBad(p)                          // 连接失败：冷却该出口，继续试下一个
             tlog({ ev: 'proxy_bad', proxy: p, err: String(e) })
@@ -228,9 +227,8 @@ export class SchedulerService extends Service {
         // 池内尝试全部失败：抛错 → 调度器重试/重入队（不直连）
         throw new Error(`proxy pool exhausted: ${url}`)
       }
-      const res = await this.fetchHard(url, timeoutMs, ctrl)
-      const body = res.ok ? new Uint8Array(await res.arrayBuffer()) : null
-      return { status: res.status, ok: res.ok, body }
+      // fetchHard 已读好 body（{status, ok, body}）——勿再 arrayBuffer（2026-09-05 重构残留 bug）
+      return await this.fetchHard(url, timeoutMs, ctrl)
     } finally {
       clearTimeout(timer)
     }
