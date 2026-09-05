@@ -13,7 +13,7 @@
  * 解耦：调度器不知道解析/存储；下游只通过事件与 ctx 服务协作。
  */
 import { Context, Service } from '@deepseek-ai/cordis'
-import type { SchedulerConfig } from '../config.ts'
+import type { SchedulerConfig, SourceConfig, SourceTransport } from '../config.ts'
 import type { FetchJob, FetchResponse } from '../types.ts'
 import { tlog } from '../trace.ts'
 import { execFile } from 'node:child_process'
@@ -57,9 +57,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 export class SchedulerService extends Service {
   config: SchedulerConfig
   /** 注入点：默认用 Node 全局 fetch；正式环境可换带代理/UA/指纹的客户端 */
-  client: HttpClient = this.defaultClient.bind(this)
+  client: HttpClient
   /** 代理池轮换器（config.proxyPool 设置时启用） */
   private rotator: ProxyRotator | null = null
+  /** 源级传输策略（2026-09-05：多源共享 fetcher 时每源声明 curl/代理/节奏；key = 源 id） */
+  private policies = new Map<string, { transport: SourceTransport; rotator: ProxyRotator | null }>()
+  /** 每源最近一次请求开始时间（源级限速节奏） */
+  private lastStartBySrc = new Map<string, number>()
 
   private queue: Job[] = []
   private park: Job[] = []                 // 重入队等待区（延迟未到，尚未回流 queue 的任务）
@@ -76,15 +80,39 @@ export class SchedulerService extends Service {
   private pending = new Map<number, { jobsLeft: number; done: (v: void) => void; fail: (e: unknown) => void }>()
   readonly stats: SchedulerStats = { ok: 0, failed: 0, requeued: 0, skipped: 0 }
 
-  constructor(ctx: Context, config: SchedulerConfig) {
+  constructor(ctx: Context, config: SchedulerConfig, sources?: SourceConfig[]) {
     super(ctx, 'scheduler')
     this.config = config
+    this.client = this.defaultClient.bind(this)
     if (config.proxyPool || config.proxyPoolSocks) {
-      this.rotator = new ProxyRotator(
-        [config.proxyPool, config.proxyPoolSocks].filter((p): p is string => !!p).map((p) => join(process.cwd(), p)),
-        config.proxyMode ?? 'round-robin')
-      tlog({ ev: 'proxy_pool', size: this.rotator.size, mode: this.rotator.mode })
-      // 保鲜刷新：定时跑 proxyCheckScript（配置）并重载池（免费代理寿命以分钟计，必须勤刷新）
+      this.setupRotator(null, [config.proxyPool, config.proxyPoolSocks].filter((p): p is string => !!p),
+        config.proxyMode ?? 'round-robin', config)
+    }
+    this.registerSources(sources ?? [])
+  }
+
+  /** 装配源级传输策略（ctor 与 watch 热接入共用——晚注册的源补策略；幂等） */
+  registerSources(sources: SourceConfig[]): void {
+    for (const s of sources ?? []) {
+      const t = s.transport
+      if (!t || this.policies.has(s.id)) continue
+      const files = [t.proxyPool, t.proxyPoolSocks].filter((p): p is string => !!p)
+      this.policies.set(s.id, {
+        transport: t,
+        rotator: files.length ? this.setupRotator(s.id, files, t.proxyMode ?? 'round-robin', this.config) : null,
+      })
+      tlog({ ev: 'source_transport', source: s.id, curl: t.curlMode ?? false, proxyPool: files.length > 0, delay: t.delayMs })
+    }
+  }
+
+  /** 建轮换器 + 保鲜刷新（全局池与源级池共用；refresh 间隔/脚本取全局配置） */
+  private setupRotator(key: string | null, files: string[], mode: 'round-robin' | 'random', config: SchedulerConfig): ProxyRotator {
+    const rot = new ProxyRotator(files.map((p) => join(process.cwd(), p)), mode)
+    if (key === null) this.rotator = rot
+    tlog({ ev: 'proxy_pool', size: rot.size, mode: rot.mode, source: key ?? 'global' })
+    if (!this._refreshArmed) {
+      this._refreshArmed = true
+      // 保鲜刷新：定时跑 proxyCheckScript（全局配置）并重载全部池（免费代理寿命以分钟计，必须勤刷新）
       // ⚠️ 必须在 try/catch + error 监听下 spawn：沙箱 EPERM 失败只记日志，绝不允许崩掉主进程（血的教训）
       const refreshSec = config.proxyRefreshSec ?? 1200
       if (refreshSec > 0 && config.proxyCheckScript) {
@@ -99,7 +127,11 @@ export class SchedulerService extends Service {
               if (code === 0) {
                 this.rotator?.reload([config.proxyPool, config.proxyPoolSocks]
                   .filter((p): p is string => !!p).map((p) => join(process.cwd(), p)))
-                tlog({ ev: 'proxy_refresh_done', size: this.rotator?.size ?? 0 })
+                for (const [, pol] of this.policies) {
+                  pol.rotator?.reload([pol.transport.proxyPool, pol.transport.proxyPoolSocks]
+                    .filter((p): p is string => !!p).map((p) => join(process.cwd(), p)))
+                }
+                tlog({ ev: 'proxy_refresh_done' })
               } else {
                 tlog({ ev: 'proxy_refresh_fail', code })
               }
@@ -110,8 +142,24 @@ export class SchedulerService extends Service {
         }, refreshSec * 1000).unref()
       }
     }
-    // 心跳：30s 打一次运行快照；在飞请求 >90s 无完成 → stall_warn（区分“慢”与“卡”）
-    setInterval(() => {
+    return rot
+  }
+
+  private _refreshArmed = false
+
+  /** 某源的传输策略（无则 null——走全局配置） */
+  private policyOf(source: string): { transport: SourceTransport; rotator: ProxyRotator | null } | null {
+    return this.policies.get(source) ?? null
+  }
+
+  /** 某源的请求间隔（源级 delayMs 优先，回退全局） */
+  private delayOf(source: string): number {
+    return this.policies.get(source)?.transport.delayMs ?? this.config.delayMs
+  }
+
+  /** 心跳：30s 打一次运行快照；在飞请求 >90s 无完成 → stall_warn（区分“慢”与“卡”）
+   *  限流恢复：冷却结束且近 60s 无 429 → 恢复并发 */
+  private heartbeat = setInterval(() => {
       const idleMs = Date.now() - this.lastFinish
       // 限流恢复：冷却结束且近 60s 无 429 → 恢复并发
       if (this.throttledUntil && Date.now() > this.throttledUntil &&
@@ -131,7 +179,6 @@ export class SchedulerService extends Service {
         last429: this.last429s.length,
       })
     }, 30_000).unref()
-  }
 
   /** 运行中调整并发（用户要求：低并发起步、稳定后加码） */
   setConcurrency(n: number) {
@@ -209,36 +256,61 @@ export class SchedulerService extends Service {
     }
   }
 
+  /** 按源取客户端（2026-09-05 多源共享）：源级传输策略优先（curl/代理轮换），
+   *  无策略 → 当前 client（注入的自定义 client——自检等；或默认客户端）。
+   *  ⚠️ cordis 经 ctx 访问服务时方法/字段会被 getTraceable 逐读包装（新代理）——
+   *  切勿对字段做身份比较（2026-09-05 实测 this.client !== this.client）。 */
+  private clientFor(job: Job): HttpClient {
+    const pol = this.policyOf(job.source)
+    const t = pol?.transport
+    if (t?.curlMode) {
+      return (u, ms) => this.curlClient(u, ms, pol!.rotator)
+    }
+    if (pol?.rotator) {
+      const attempts = t!.proxyAttempts ?? this.config.proxyAttempts ?? 3
+      return (u, ms) => this.proxyClient(u, ms, pol.rotator!, attempts, t!.proxyMode)
+    }
+    return this.client
+  }
+
   private async defaultClient(url: string, timeoutMs: number) {
     // curl 模式（TLS 指纹风控站）：spawn curl.exe（schannel 指纹放行；node/python OpenSSL 被拒）
     if (this.config.curlMode) {
-      return this.curlClient(url, timeoutMs)
+      return this.curlClient(url, timeoutMs, this.rotator)
     }
+    if (this.rotator) {
+      return this.proxyClient(url, timeoutMs, this.rotator, this.config.proxyAttempts ?? 3)
+    }
+    // fetchHard 已读好 body（{status, ok, body}）——勿再 arrayBuffer（2026-09-05 重构残留 bug）
+    return this.fetchHard(url, timeoutMs, new AbortController())
+  }
+
+  /** 纯代理尝试循环：依次试 proxyAttempts 个池内出口（失败 reportBad 冷却换下一个）；
+   *  池内全部失败 → 抛错交调度器重试/重入队（【绝不直连兜底】，保全单 IP 不被盾）。 */
+  private async proxyClient(
+    url: string, timeoutMs: number, rotator: ProxyRotator,
+    attempts: number, _mode?: 'round-robin' | 'random',
+  ) {
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), timeoutMs)
     try {
-      if (this.rotator) {
-        const attempts = this.config.proxyAttempts ?? 3
-        for (let i = 0; i < attempts; i++) {
-          const p = this.rotator.next()
-          if (!p) break
-          try {
-            tlog({ ev: 'proxy_try', proxy: p, url })
-            const dispatcher: any = p.startsWith('socks')
-              ? new SocksProxyAgent(p, { timeout: this.config.timeoutMs })
-              : new ProxyAgent(p)
-            const res = await this.fetchHard(url, timeoutMs, ctrl, dispatcher)
-            return { status: res.status, ok: res.ok, body: res.body }   // fetchHard 已读 body（勿 arrayBuffer）
-          } catch (e) {
-            this.rotator.reportBad(p)                          // 连接失败：冷却该出口，继续试下一个
-            tlog({ ev: 'proxy_bad', proxy: p, err: String(e) })
-          }
+      for (let i = 0; i < attempts; i++) {
+        const p = rotator.next()
+        if (!p) break
+        try {
+          tlog({ ev: 'proxy_try', proxy: p, url })
+          const dispatcher: any = p.startsWith('socks')
+            ? new SocksProxyAgent(p, { timeout: this.config.timeoutMs })
+            : new ProxyAgent(p)
+          const res = await this.fetchHard(url, timeoutMs, ctrl, dispatcher)
+          return { status: res.status, ok: res.ok, body: res.body }   // fetchHard 已读 body（勿 arrayBuffer）
+        } catch (e) {
+          rotator.reportBad(p)                          // 连接失败：冷却该出口，继续试下一个
+          tlog({ ev: 'proxy_bad', proxy: p, err: String(e) })
         }
-        // 池内尝试全部失败：抛错 → 调度器重试/重入队（不直连）
-        throw new Error(`proxy pool exhausted: ${url}`)
       }
-      // fetchHard 已读好 body（{status, ok, body}）——勿再 arrayBuffer（2026-09-05 重构残留 bug）
-      return await this.fetchHard(url, timeoutMs, ctrl)
+      // 池内尝试全部失败：抛错 → 调度器重试/重入队（不直连）
+      throw new Error(`proxy pool exhausted: ${url}`)
     } finally {
       clearTimeout(timer)
     }
@@ -246,22 +318,22 @@ export class SchedulerService extends Service {
 
   /** curl 模式 client：spawn curl.exe（schannel TLS 指纹——指纹风控站放行 curl 拒 node/python）。
    *  -f：4xx/5xx 视为失败（退出码非 0 → 抛错交调度器重试，近似瞬时失败）
-   *  -e 同域 referer；proxyPool 配置时经 rotator 轮换代理出口（IP 限速站换 IP 绕过）——
+   *  -e 同域 referer；proxy 非空时经其轮换代理出口（IP 限速站换 IP 绕过）——
    *  失败/空响应 → reportBad 冷却该代理。输出经 pipe 捕获（maxBuffer 128MB 防大文件截断） */
-  private curlClient(url: string, timeoutMs: number): Promise<{ status: number; ok: boolean; body: Uint8Array | null }> {
+  private curlClient(url: string, timeoutMs: number, proxy: ProxyRotator | null): Promise<{ status: number; ok: boolean; body: Uint8Array | null }> {
     return new Promise((resolve, reject) => {
-      const proxy = this.rotator ? this.rotator.next() : null
+      const prx = proxy ? proxy.next() : null
       const args = [
         '-sL', '-f', '--max-time', String(Math.ceil(timeoutMs / 1000) + 5),
         '-A', SchedulerService.UA,
         '-e', new URL(url).origin + '/',
       ]
-      if (proxy) args.push('-x', proxy)
+      if (prx) args.push('-x', prx)
       args.push(url)
       execFile('curl.exe', args, { maxBuffer: 128 * 1024 * 1024, encoding: 'buffer', windowsHide: true },
         (err, stdout) => {
           if (err || !stdout || stdout.length === 0) {
-            if (proxy) this.rotator?.reportBad(proxy)
+            if (prx) proxy?.reportBad(prx)
             reject(new Error(`curl 失败: ${String(err ?? '空响应').slice(0, 100)}`))
             return
           }
@@ -315,15 +387,17 @@ export class SchedulerService extends Service {
   private async loop() {
     if (this.loopBusy) return
     this.loopBusy = true
-    let lastStart = 0
     try {
       while (true) {
         if (this.paused) break
         if (this.queue.length && this.running < this.config.concurrency) {
-          const wait = this.config.delayMs - (Date.now() - lastStart)
-          if (wait > 0) await sleep(wait)
-          lastStart = Date.now()
           const job = this.queue.shift()!
+          // 源级限速节奏（多源共进程时各站独立 delayMs；无策略源回退全局）
+          const srcDelay = this.delayOf(job.source)
+          const lastStart = this.lastStartBySrc.get(job.source) ?? 0
+          const wait = srcDelay - (Date.now() - lastStart)
+          if (wait > 0) await sleep(wait)
+          this.lastStartBySrc.set(job.source, Date.now())
           this.running++
           void this.runOne(job)
             .catch((e) => this.ctx.logger.error('job crashed: %s (%s)', job.url, String(e)))
@@ -351,15 +425,20 @@ export class SchedulerService extends Service {
     job.attempts++
     const t0 = Date.now()
     let outcome: Outcome = { kind: 'transient', err: 'unknown' }
+    const pol = this.policyOf(job.source)
+    const effRetries = pol?.transport.retries ?? this.config.retries
+    const effRetryDelay = pol?.transport.retryDelayMs ?? this.config.retryDelayMs
+    const effTimeout = pol?.transport.timeoutMs ?? this.config.timeoutMs
+    const client = this.clientFor(job)        // 按源路由（curl/代理/注入/全局）
 
-    for (let attempt = 0; attempt <= this.config.retries; attempt++) {
+    for (let attempt = 0; attempt <= effRetries; attempt++) {
       if (attempt > 0) {
-        const backoff = this.config.retryDelayMs * 2 ** (attempt - 1)
+        const backoff = effRetryDelay * 2 ** (attempt - 1)
         this.ctx.logger.warn('重试 %s（第 %d 次，%dms 后）', job.url, attempt, backoff)
         await sleep(backoff)
       }
       try {
-        const r = await this.client(job.url, this.config.timeoutMs)
+        const r = await client(job.url, effTimeout)
         if (r.status === 429 || r.status === 503 || r.status === 444) {
           // 444 = nginx 无响应（目标限流站 等站反爬/死连接特征）：按限流处理——降并发 + 瞬时重试退避
           this.noticeLimited(Date.now())
@@ -379,7 +458,7 @@ export class SchedulerService extends Service {
         outcome = { kind: 'transient', res, err: `HTTP ${r.status}` }
       } catch (e) {
         outcome = { kind: 'transient', err: String(e) }
-        if (attempt >= this.config.retries) break
+        if (attempt >= effRetries) break
       }
     }
 

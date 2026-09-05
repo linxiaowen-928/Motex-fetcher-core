@@ -34,6 +34,32 @@ export interface SourceConfig {
   /** 【源级索引池文件】相对运行目录（多源共享 fetcher 时每源自己的池；
    *  缺省：单源回退全局 indexFile，多源 pool/<id>.index.jsonl） */
   indexFile?: string
+  /** 【源级传输策略】（2026-09-05 架构修正：多源共享 fetcher 时每源自己声明网络行为——
+   *  TLS 指纹站 curl 抓取 / IP 限速站代理轮换 / 每源限速节奏；缺省字段回退全局 scheduler。
+   *  注：并发窗口仍是全局总闸，各源节奏靠 delayMs 独立控制） */
+  transport?: SourceTransport
+}
+
+/** 源级传输策略：curl 模式、代理池、请求节奏（缺省回退全局 scheduler 对应字段） */
+export interface SourceTransport {
+  /** 该源走 curl.exe 抓取（schannel TLS 指纹；覆盖全局 curlMode） */
+  curlMode?: boolean
+  /** 该源 http 代理池文件（相对运行目录；覆盖全局 proxyPool） */
+  proxyPool?: string
+  /** 该源 socks 代理池文件（覆盖全局 proxyPoolSocks） */
+  proxyPoolSocks?: string
+  /** 代理轮换模式：round-robin（默认）/ random */
+  proxyMode?: 'round-robin' | 'random'
+  /** 单请求最多尝试的池内出口数（默认 3） */
+  proxyAttempts?: number
+  /** 该源两次请求间最小间隔（毫秒；覆盖全局 delayMs——多源各站节奏独立） */
+  delayMs?: number
+  /** 该源单请求超时（毫秒；覆盖全局 timeoutMs） */
+  timeoutMs?: number
+  /** 该源单次尝试内的重试次数（覆盖全局 retries） */
+  retries?: number
+  /** 该源重试基础退避（毫秒；覆盖全局 retryDelayMs） */
+  retryDelayMs?: number
 }
 
 export interface SchedulerConfig {

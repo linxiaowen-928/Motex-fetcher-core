@@ -51,7 +51,7 @@ function sourceOutDir(cfg: FetcherConfig, srcId: string): string {
  */
 export interface FetchCoreOptions {
   services?: Partial<{
-    scheduler: new (ctx: Context, cfg: SchedulerConfig) => SchedulerService
+    scheduler: new (ctx: Context, cfg: SchedulerConfig, sources?: SourceConfig[]) => SchedulerService
     indexer: new (ctx: Context) => IndexerService
     parser: new (ctx: Context) => ParserService
     storage: new (ctx: Context, cfg: StorageConfig, sources?: SourceConfig[]) => StorageService
@@ -66,7 +66,7 @@ export interface FetchCoreOptions {
 export function assembleApp(ctx: Context, cfg: FetcherConfig, opts: FetchCoreOptions = {}): Context {
   opts.beforeServices?.(ctx, cfg)
   const S = opts.services?.scheduler ?? SchedulerService
-  new S(ctx, cfg.scheduler)
+  new S(ctx, cfg.scheduler, cfg.sources)
   const I = opts.services?.indexer ?? IndexerService
   new I(ctx)
   const P = opts.services?.parser ?? ParserService

@@ -93,6 +93,7 @@ export const fetcherPlugin = {
         if (!cfg.sources.some((s) => s.id === src.id)) {
           cfg.sources.push(src)
           ctx.storage.registerSourceDirs([src])   // 源级 outDir（热接入晚于服务装配）
+          ctx.scheduler.registerSources([src])    // 源级传输策略（curl/代理/节奏）
         }
         ctx.logger.info('[fetcher] 热接入新源 %s（kind=%s）：入扫池循环', src.id, src.kind)
         wake?.()
