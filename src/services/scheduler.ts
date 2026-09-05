@@ -66,8 +66,14 @@ export class SchedulerService extends Service {
   /** 每源最近一次请求开始时间（源级限速节奏） */
   private lastStartBySrc = new Map<string, number>()
 
-  private queue: Job[] = []
-  private park: Job[] = []                 // 重入队等待区（延迟未到，尚未回流 queue 的任务）
+  /** 每源独立队列（2026-09-05 多源公平重构）：单一队列 + 窗口扫描有队首偏袒——
+   *  试点实测头部源永远饱和、后排源零派发。每源队列 + 轮转派发 = O(1) 天然公平。 */
+  private queues = new Map<string, Job[]>()
+  /** 有任务的源（轮转顺序） */
+  private order: string[] = []
+  /** 轮转指针（下一个优先派发的源） */
+  private srcCursor = 0
+  private park: Job[] = []                 // 重入队等待区（延迟未到，尚未回流队列的任务）
   private visited = new Set<string>()          // 已抓/在抓/已放弃 的 url（去重）
   private failed = new Map<string, string>()   // 终局失败 url → 所属源（兜底重试轮要用）
   private paused = false                        // 优雅暂停（manage API / pause flag 设置）：停止取新任务，批次尽快结算
@@ -80,6 +86,31 @@ export class SchedulerService extends Service {
   private throttledUntil = 0
   private pending = new Map<number, { jobsLeft: number; done: (v: void) => void; fail: (e: unknown) => void }>()
   readonly stats: SchedulerStats = { ok: 0, failed: 0, requeued: 0, skipped: 0 }
+
+  /** 全部源的在队任务总数 */
+  private queuedCount(): number {
+    let n = 0
+    for (const q of this.queues.values()) n += q.length
+    return n
+  }
+
+  /** 源入轮转（队列为空的新源/补源） */
+  private ensureOrder(source: string): void {
+    if (!this.queues.has(source) || !this.queues.get(source)!.length) {
+      if (!this.order.includes(source)) this.order.push(source)
+    }
+  }
+
+  /** 源队列清空 → 摘出轮转 */
+  private dropSource(source: string): void {
+    this.queues.delete(source)
+    const i = this.order.indexOf(source)
+    if (i >= 0) {
+      this.order.splice(i, 1)
+      if (i < this.srcCursor) this.srcCursor--
+      if (this.srcCursor >= this.order.length) this.srcCursor = 0
+    }
+  }
 
   constructor(ctx: Context, config: SchedulerConfig, sources?: SourceConfig[]) {
     super(ctx, 'scheduler')
@@ -172,7 +203,7 @@ export class SchedulerService extends Service {
       }
       tlog({
         ev: 'hb',
-        queue: this.queue.length, running: this.running, park: this.park.length,
+        queue: this.queuedCount(), running: this.running, park: this.park.length,
         concurrency: this.config.concurrency, idleMs,
         ok: this.stats.ok, failed: this.stats.failed,
         requeued: this.stats.requeued, skipped: this.stats.skipped,
@@ -195,7 +226,7 @@ export class SchedulerService extends Service {
     // 批次尽快结算：pending 承诺直接 resolve（在飞任务结束后 finishJob 对其已是 no-op）
     for (const [, h] of this.pending) h.done()
     this.pending.clear()
-    tlog({ ev: 'pause_set', queue: this.queue.length, running: this.running })
+    tlog({ ev: 'pause_set', queue: this.queuedCount(), running: this.running })
   }
 
   isPaused(): boolean {
@@ -377,8 +408,14 @@ export class SchedulerService extends Service {
         batchId: id,
         continuationOf: opts?.continuationOf,
       }
-      if (opts?.front) this.queue.unshift(job)
-      else this.queue.push(job)
+      let q = this.queues.get(source)
+      if (!q) {
+        q = []
+        this.queues.set(source, q)
+        if (!this.order.includes(source)) this.order.push(source)
+      }
+      if (opts?.front) q.unshift(job)
+      else q.push(job)
       jobsLeft++
     }
     tlog({ ev: 'push', n: urls.length, added: jobsLeft, source, forced: opts?.force ?? false, front: opts?.front ?? false })
@@ -396,70 +433,55 @@ export class SchedulerService extends Service {
     return p
   }
 
-  /** 单飞 worker 循环：队列/并发窗口/限速 → 派发；全部落定后结算批次 */
+  /** 单飞 worker 循环：每源队列轮转派发（源级限速内循环等就绪）；全部落定后结算批次 */
   private async loop() {
     if (this.loopBusy) return
     this.loopBusy = true
     try {
       while (true) {
         if (this.paused) break
-        if (this.queue.length && this.running < this.config.concurrency) {
-          await this.dispatchOne()     // 公平取队 + 源级限速（内部可能等待节奏）
-        } else if (this.queue.length === 0 && this.running === 0 && this.park.length === 0) {
+        if (this.running < this.config.concurrency && this.dispatchOne()) continue
+        if (this.order.length === 0 && this.running === 0 && this.park.length === 0) {
           this.ctx.logger.debug('scheduler drained')
           void this.checkpoint()               // 批次清空后自动落一次 checkpoint（断点）
           for (const [, h] of this.pending) h.done()
           this.pending.clear()
           break
-        } else {
-          await sleep(50)
         }
+        await sleep(50)
       }
     } finally {
       this.loopBusy = false
     }
   }
 
-  /** 公平派发一个任务（2026-09-05 多源共享）：窗口内优先取【限速已就绪】且【在飞最少】的源的任务——
-   *  防大池源饿死小池源（全池 force 入队时队列按源成块，纯 FIFO 会让后面的源等到天荒地老）。
-   *  窗口内无就绪任务 → 睡到最早就绪时刻再试。 */
-  private runningBySrc = new Map<string, number>()
-
-  private async dispatchOne(): Promise<void> {
-    const WINDOW = 64
-    const n = Math.min(this.queue.length, WINDOW)
+  /** 轮转派发一个任务（2026-09-05 每源队列重构）：从轮转指针起找【限速已就绪】的源取队首任务——
+   *  一圈内各源轮流拿派发位，就绪慢的源不阻塞就绪快的源；O(1)，无窗口偏袒。
+   *  全部源都在限速中 → 返回 false（loop 50ms 后再试）。 */
+  private dispatchOne(): boolean {
+    const n = this.order.length
+    if (!n) return false
     const now = Date.now()
-    let best = -1
-    let bestActive = Infinity
-    let minWait = Infinity
-    for (let i = 0; i < n; i++) {
-      const j = this.queue[i]!
-      const active = this.runningBySrc.get(j.source) ?? 0
-      const wait = this.delayOf(j.source) - (now - (this.lastStartBySrc.get(j.source) ?? 0))
-      if (wait <= 0 && active < bestActive) {
-        bestActive = active
-        best = i
-        if (active === 0) break                 // 有空闲源任务就绪 → 不用再找
-      }
-      if (wait > 0 && wait < minWait) minWait = wait
+    for (let k = 0; k < n; k++) {
+      const sid = this.order[(this.srcCursor + k) % n]!
+      const q = this.queues.get(sid)
+      if (!q || !q.length) continue
+      const delay = this.delayOf(sid)
+      if (now - (this.lastStartBySrc.get(sid) ?? 0) < delay) continue   // 该源限速中 → 看下一源
+      const job = q.shift()!
+      this.lastStartBySrc.set(sid, now)
+      this.srcCursor = (this.srcCursor + k + 1) % n
+      if (!q.length) this.dropSource(sid)
+      this.running++
+      void this.runOne(job)
+        .catch((e) => this.ctx.logger.error('job crashed: %s (%s)', job.url, String(e)))
+        .finally(() => {
+          this.running--
+          void this.loop()
+        })
+      return true
     }
-    if (best < 0) {
-      if (minWait < Infinity) await sleep(minWait)
-      return
-    }
-    const [job] = this.queue.splice(best, 1)
-    this.lastStartBySrc.set(job.source, Date.now())
-    this.running++
-    this.runningBySrc.set(job.source, (this.runningBySrc.get(job.source) ?? 0) + 1)
-    void this.runOne(job)
-      .catch((e) => this.ctx.logger.error('job crashed: %s (%s)', job.url, String(e)))
-      .finally(() => {
-        this.running--
-        const left = (this.runningBySrc.get(job.source) ?? 1) - 1
-        if (left <= 0) this.runningBySrc.delete(job.source)
-        else this.runningBySrc.set(job.source, left)
-        void this.loop()
-      })
+    return false
   }
 
   /** 单个任务：尝试 → 分类结局 → (重试退避 | 瞬时失败重入队 | 永久失败) */
@@ -524,7 +546,13 @@ export class SchedulerService extends Service {
       setTimeout(() => {
         const i = this.park.indexOf(job)
         if (i >= 0) this.park.splice(i, 1)
-        this.queue.push(job)
+        let q = this.queues.get(job.source)
+        if (!q) {
+          q = []
+          this.queues.set(job.source, q)
+          if (!this.order.includes(job.source)) this.order.push(job.source)
+        }
+        q.push(job)
         void this.loop()
       }, delay)
       if (outcome.res) this.ctx.emit('fetch/response', outcome.res)   // 让统计侧可见该次失败
@@ -583,7 +611,7 @@ export class SchedulerService extends Service {
 
   /** 断点：等待所有任务（含分页续推）完全落定后再返回（自检/收尾用）；暂停后立即返回 */
   async waitIdle() {
-    while (!this.paused && (this.queue.length || this.running || this.park.length || this.pending.size)) {
+    while (!this.paused && (this.order.length || this.running || this.park.length || this.pending.size)) {
       await sleep(100)
     }
   }
@@ -591,8 +619,10 @@ export class SchedulerService extends Service {
   // ============ 断点：快照 / 恢复 ============
 
   snapshot(): SchedulerSnapshot {
+    const flat: Job[] = []
+    for (const q of this.queues.values()) for (const j of q) flat.push(j)
     return {
-      queue: [...this.queue, ...this.park],   // 等待区任务也要进快照（防崩溃丢失）
+      queue: [...flat, ...this.park],   // 等待区任务也要进快照（防崩溃丢失）
       visited: [...this.visited],
       failed: [...this.failed].map(([url, source]) => ({ url, source })),
       stats: { ...this.stats },
@@ -605,11 +635,19 @@ export class SchedulerService extends Service {
     // 恢复只回填【未终局】的任务：visited 里没有 failed 的丢回队尾（attempts 保留，沿用 maxAttempts 上限）
     for (const j of snap.queue) {
       if (!this.failed.has(j.url) && !this.visited.has(j.url)) this.visited.add(j.url)
-      if (!this.failed.has(j.url)) this.queue.push(j)
+      if (!this.failed.has(j.url)) {
+        let q = this.queues.get(j.source)
+        if (!q) {
+          q = []
+          this.queues.set(j.source, q)
+          this.order.push(j.source)
+        }
+        q.push(j)
+      }
     }
     this.stats.ok = snap.stats.ok; this.stats.failed = snap.stats.failed
     this.stats.requeued = snap.stats.requeued; this.stats.skipped = snap.stats.skipped
-    this.ctx.logger.info('恢复断点：队内 %d 个未终局任务', this.queue.length)
+    this.ctx.logger.info('恢复断点：队内 %d 个未终局任务', this.queuedCount())
   }
 
   /** 把当前队列/已访问/失败清单写入状态文件（进程重启后可 restore 续跑） */

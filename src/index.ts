@@ -365,7 +365,7 @@ async function readPoolDelta(
   }
   const p = join(process.cwd(), file)
   let size = 0
-  try { size = (await statP(p)).size } catch { return 0 }
+  try { size = statSync(p).size } catch { return 0 }
   let cur = cursors.get(file) ?? { pos: 0, tail: '' }
   if (size < cur.pos) cur = { pos: 0, tail: '' }        // 截断/重建 → 全量
   if (size === cur.pos) {
@@ -456,9 +456,10 @@ export async function runCrawlTail(
       bySrc.delete(src.id)
     }
   }
-  // 入队（2026-09-05 多源公平）：按 CHUNK 轮转各源入队（不逐批 await——按批结算已修，
-  // 多批可同时在队），避免大池源整块占队头把其余源饿死几小时（试点实测：单源独占 4 并发窗）。
-  const CHUNK = 500
+  // 入队（2026-09-05 多源公平）：小块(16)轮转各源交错入队——块越大队首源连发越长，
+  // 试点 500/块 → crxs 独占 15 分钟才轮到下一站；16/块 + 派发窗口 128（覆盖 7 源 × 16）
+  // 让各源在派发窗口内互相可见，谁限速就绪且在飞少谁先走（按批结算已修，多批可同时在队）。
+  const CHUNK = 16
   const entries = [...bySrc.entries()]
   const maxLen = Math.max(0, ...entries.map(([, u]) => u.length))
   for (let pos = 0; pos < maxLen; pos += CHUNK) {
