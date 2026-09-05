@@ -16,9 +16,8 @@
  *   fetcherPlugin                 —— cordis 插件形式（src/fetcher.ts），配合 loader.ts 的 cordis.yml 使用
  */
 import { Context } from '@deepseek-ai/cordis'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { createReadStream } from 'node:fs'
-import { createInterface } from 'node:readline'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { open as openP } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { loadConfig, type FetcherConfig, type SchedulerConfig, type SourceConfig, type StorageConfig } from './config.ts'
 import { SchedulerService, type SchedulerSnapshot } from './services/scheduler.ts'
@@ -215,6 +214,7 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
     if (cfg.scheduler.stateFile && existsSync(statePath)) {
       const snap = JSON.parse(readFileSync(statePath, 'utf-8')) as SchedulerSnapshot
       app.scheduler.restore(snap)
+      tlog({ ev: 'restored', queue: snap.queue.length, visited: snap.visited.length })
     }
     // 退出钩子：Ctrl+C / kill 时先落 checkpoint
     for (const sig of ['SIGINT', 'SIGTERM'] as const) {
@@ -293,12 +293,12 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
         tlog({ ev: 'update_plan', added })
       } else {
         if (phase === 'crawl') {
-          // 从索引池恢复爬取任务（按源：源级 indexFile 优先——多源共享 fetcher 时每源自己的池）
+          // 从索引池恢复爬取任务（按源增量读：源级 indexFile 优先；进程内每轮只读新追加字节）
           for (const src of cfg.sources) {
             const file = sourceIndexFile(cfg, src)
-            const recs = loadIndex(file)
-            for (const r of recs) pool.push({ url: r.url, source: r.source })
-            app.logger.info('索引池 %s：%d 条', file, recs.length)
+            const n = await readPoolDelta(app, cfg, src, pool)
+            tlog({ ev: 'pool_read', source: src.id, file, added: n })
+            app.logger.info('索引池 %s：增量 %d 条', file, n)
           }
         }
         await runCrawlTail(app, cfg, pool, { limit, selfTest })
@@ -348,6 +348,66 @@ function sourceIndexFile(cfg: FetcherConfig, src: SourceConfig): string {
   return `pool/${src.id}.index.jsonl`
 }
 
+/** 池文件游标（进程内，2026-09-05 单进程常驻）：每轮只读【新追加字节】——
+ *  旧实现每轮全量同步读池（SMR 盘上 48k 行可卡 14s+ 且冻结事件循环，试点实测）。
+ *  池文件只追加不重写 → 字节游标安全；文件被截断/重建 → 归零全量重扫。 */
+const poolCursors = new WeakMap<FetcherConfig, Map<string, { pos: number; tail: string }>>()
+
+async function readPoolDelta(
+  app: Context, cfg: FetcherConfig, src: SourceConfig,
+  sink: { url: string; source: string }[],
+): Promise<number> {
+  const file = sourceIndexFile(cfg, src)
+  let cursors = poolCursors.get(cfg)
+  if (!cursors) {
+    cursors = new Map()
+    poolCursors.set(cfg, cursors)
+  }
+  const p = join(process.cwd(), file)
+  let size = 0
+  try { size = (await statP(p)).size } catch { return 0 }
+  let cur = cursors.get(file) ?? { pos: 0, tail: '' }
+  if (size < cur.pos) cur = { pos: 0, tail: '' }        // 截断/重建 → 全量
+  if (size === cur.pos) {
+    cursors.set(file, cur)
+    return 0
+  }
+  let added = 0
+  let fh: Awaited<ReturnType<typeof openP>> | null = null
+  try {
+    fh = await openP(p, 'r')
+    const st = await fh.stat()
+    const len = st.size - cur.pos
+    const buf = Buffer.alloc(len)
+    let read = 0
+    while (read < len) {
+      const { bytesRead } = await fh.read(buf, read, len - read, cur.pos + read)
+      if (bytesRead <= 0) break
+      read += bytesRead
+    }
+    cur.pos += read
+    const text = cur.tail + buf.toString('utf8', 0, read)
+    const lines = text.split('\n')
+    cur.tail = text.endsWith('\n') ? '' : (lines.pop() ?? '')
+    for (const ln of lines) {
+      if (!ln.trim()) continue
+      try {
+        const r = JSON.parse(ln) as { url?: string; source?: string }
+        if (r.url) {
+          sink.push({ url: r.url, source: r.source ?? src.id })
+          added++
+        }
+      } catch { /* 坏行忽略 */ }
+    }
+  } catch (e) {
+    app.logger.warn('[pool] 增量读失败 %s: %s', file, String(e).slice(0, 120))
+  } finally {
+    if (fh) await fh.close()
+  }
+  cursors.set(file, cur)
+  return added
+}
+
 /** 爬取收尾（runPhase 与 watch 常驻扫池共用）：skipExisting → 限数 → 按源入队（force）→ 落定 → 兜底重试。
  *  优雅暂停：waitIdle 立即返回；已暂停则跳过兜底重试（checkpoint 已含失败清单，恢复后再跑）。 */
 export async function runCrawlTail(
@@ -359,50 +419,17 @@ export async function runCrawlTail(
   const selfTest = opts.selfTest ?? false
   const s = app.scheduler.stats
   if (cfg.skipExisting) {
-    // 跳过已在输出 JSONL 中存在的 url（断点式续爬）
-    // 快路径：读 <src>.done.urls 已爬记录（storage.append 增量维护，纯 url 行）；
-    // 慢路径（仅首次）：流式扫 JSONL 生成 done.urls（避免 GB 级文件全量进内存）。
-    const seen = new Set<string>()
-    for (const src of new Set(pool.map((p) => p.source))) {
-      const donePath = join(sourceOutDir(cfg, src), `${src}.done.urls`)
-      if (existsSync(donePath)) {
-        const text = readFileSync(donePath, 'utf-8')
-        for (const ln of text.split('\n')) {
-          const u = ln.trim()
-          if (u) seen.add(u)
-        }
-        app.logger.info('skipExisting：快路径 %s（%d 条已爬）', donePath, seen.size)
-      } else {
-        // 慢路径（仅首次）：流式扫 JSONL 全部分片（主文件 + .partN）生成 done.urls
-        const outDir = sourceOutDir(cfg, src)
-        const jsonls = existsSync(outDir)
-          ? readdirSync(outDir).filter((f) => f === `${src}.jsonl` || f.startsWith(`${src}.jsonl.part`)).sort()
-          : []
-        let n = 0
-        let buf: string[] = []
-        for (const jf of jsonls) {
-          const rl = createInterface({ input: createReadStream(join(outDir, jf)), crlfDelay: Infinity })
-          for await (const ln of rl) {
-            try {
-              const u = (JSON.parse(ln) as { url: string }).url
-              if (u) {
-                seen.add(u)
-                buf.push(u)
-              }
-            } catch { /* 坏行忽略 */ }
-            if (buf.length >= 8000) {
-              appendFileSync(donePath, buf.join('\n') + '\n')
-              buf = []
-            }
-          }
-        }
-        if (buf.length) appendFileSync(donePath, buf.join('\n') + '\n')
-        n = seen.size
-        app.logger.info('skipExisting：首次生成 %s（%d 条已爬，%d 分片流式扫描）', donePath, n, jsonls.length)
-      }
-    }
+    // 跳过已在输出 JSONL 中存在的 url（断点式续爬）。
+    // 已爬集合由 storage 维护：进程内惰性全量载入一次 + append 增量（2026-09-05 单进程常驻——
+    // 旧实现每轮全量同步读 done.urls，SMR 盘上可卡死事件循环数分钟，试点实测）。
+    const doneMap = new Map<string, Set<string>>()
+    const srcs = new Set(pool.map((p) => p.source))
+    tlog({ ev: 'skip_load', sources: [...srcs] })
+    await Promise.all([...srcs].map(async (src) => {
+      doneMap.set(src, await app.storage.doneSet(src))
+    }))
     const before = pool.length
-    const kept = pool.filter((p) => !seen.has(p.url))
+    const kept = pool.filter((p) => !doneMap.get(p.source)?.has(p.url))
     app.logger.info('skipExisting：过滤 %d 条已爬，剩 %d 条', before - kept.length, kept.length)
     pool.length = 0
     for (const k of kept) pool.push(k)      // 不用 ...spread：十几万元素会被调用栈限制爆掉
@@ -467,9 +494,8 @@ export async function runCrawlSweep(app: Context, cfg: FetcherConfig, opts: RunP
   const pool: { url: string; source: string }[] = []
   for (const src of cfg.sources) {
     const file = sourceIndexFile(cfg, src)
-    const recs = loadIndex(file)
-    for (const r of recs) pool.push({ url: r.url, source: r.source })
-    app.logger.info('[sweep] 池 %s：%d 条', file, recs.length)
+    const n = await readPoolDelta(app, cfg, src, pool)
+    app.logger.info('[sweep] 池 %s：增量 %d 条', file, n)
   }
   await runCrawlTail(app, cfg, pool, { limit: opts.limit ?? 0, selfTest: opts.selfTest })
 }
@@ -557,20 +583,4 @@ function parseConfigPath(args: string[]): string | undefined {
 function getArg(args: string[], name: string): string | undefined {
   const i = args.indexOf(name)
   return i >= 0 && args[i + 1] ? args[i + 1] : undefined
-}
-
-function loadIndex(indexFile: string): { url: string; source: string }[] {
-  try {
-    const text = readFileSync(join(process.cwd(), indexFile), 'utf-8')
-    const out: { url: string; source: string }[] = []
-    for (const ln of text.split('\n').filter(Boolean)) {
-      try {
-        const r = JSON.parse(ln) as { url?: string; source?: string }
-        if (r.url) out.push({ url: r.url, source: r.source ?? 'unknown' })
-      } catch { /* 忽略坏行 */ }
-    }
-    return out
-  } catch {
-    return []
-  }
 }

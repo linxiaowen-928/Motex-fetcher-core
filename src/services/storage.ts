@@ -4,7 +4,11 @@
  */
 import { appendFile, mkdir, open, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
-import { createWriteStream, existsSync, readFileSync, statSync } from 'node:fs'
+import {
+  appendFileSync, createReadStream, createWriteStream,
+  existsSync, readFileSync, readdirSync, statSync,
+} from 'node:fs'
+import { createInterface } from 'node:readline'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -18,6 +22,10 @@ export class StorageService extends Service {
   /** 源 → 输出目录（源级声明；2026-09-05 起站点扩展自己注册输出位置） */
   private readonly sourceDirs = new Map<string, string>()
   private stripNewlines: boolean
+  /** 已爬集合（源 → Set<url>；惰性全量载入一次，append 增量维护）——2026-09-05 单进程常驻：
+   *  免扫池每轮全量重读 done.urls（SMR 盘同步读可卡死事件循环数分钟，试点实测） */
+  private readonly doneSets = new Map<string, Set<string>>()
+  private readonly doneLoads = new Map<string, Promise<Set<string>>>()
 
   constructor(ctx: Context, config: StorageConfig, sources?: SourceConfig[]) {
     super(ctx, 'storage')
@@ -40,6 +48,65 @@ export class StorageService extends Service {
     }
   }
 
+  /** 某源的已爬集合（惰性载入一次；并发调用共享同一载入）。异步流式读——不阻塞事件循环。 */
+  async doneSet(source: string): Promise<Set<string>> {
+    const p = this.doneLoads.get(source)
+    if (p) return p
+    const loading = this.loadDoneSet(source)
+    this.doneLoads.set(source, loading)
+    return loading
+  }
+
+  private async loadDoneSet(source: string): Promise<Set<string>> {
+    const set = new Set<string>()
+    this.doneSets.set(source, set)
+    const dir = this.dirFor(source)
+    const donePath = join(dir, `${source}.done.urls`)
+    if (existsSync(donePath) && statSync(donePath).size > 0) {
+      // 快路径：流式读 done.urls（纯 url 行）；载入期间可能又有 append → 尾部补读
+      for (let pass = 0; pass < 3; pass++) {
+        const size0 = statSync(donePath).size
+        const start = pass === 0 ? 0 : size0
+        const rl = createInterface({
+          input: createReadStream(donePath, { start }),
+          crlfDelay: Infinity,
+        })
+        for await (const ln of rl) {
+          const u = ln.trim()
+          if (u) set.add(u)
+        }
+        if (statSync(donePath).size <= size0) break
+      }
+    } else if (existsSync(dir)) {
+      // 慢路径（仅首次，done.urls 缺失）：流式扫 JSONL 全部分片生成 done.urls
+      // （避免 GB 级文件全量进内存；生成后后续启动走快路径）
+      let files: string[] = []
+      try { files = readdirSync(dir) } catch { /* 目录不可读则跳过 */ }
+      const jsonls = files.filter((f) => f === `${source}.jsonl` || f.startsWith(`${source}.jsonl.part`)).sort()
+      let buf: string[] = []
+      for (const jf of jsonls) {
+        const rl = createInterface({ input: createReadStream(join(dir, jf)), crlfDelay: Infinity })
+        for await (const ln of rl) {
+          try {
+            const u = (JSON.parse(ln) as { url: string }).url
+            if (u) {
+              set.add(u)
+              buf.push(u)
+            }
+          } catch { /* 坏行忽略 */ }
+          if (buf.length >= 8000) {
+            try { appendFileSync(donePath, buf.join('\n') + '\n'); buf = [] } catch { /* 已爬记录失败不致命 */ }
+          }
+        }
+      }
+      if (buf.length) {
+        try { appendFileSync(donePath, buf.join('\n') + '\n') } catch { /* 同上 */ }
+      }
+    }
+    this.ctx.logger.info('[storage] 已爬集合 %s：%d 条', source, set.size)
+    return set
+  }
+
   /** 追加一条正文条目到 <source>.jsonl（默认剥掉文本内换行：训练语料不需要 \n），
    *  并同步追加一行 url 到 <source>.done.urls（已爬记录，重启快速去重用，免全量重扫 JSONL）。 */
   async append(item: ParsedItem): Promise<void> {
@@ -48,6 +115,7 @@ export class StorageService extends Service {
     await this.writeLine(`${out.source}.jsonl`, out, dir)
     try {
       await appendFile(join(dir, `${out.source}.done.urls`), out.url + '\n', 'utf-8')
+      this.doneSets.get(out.source)?.add(out.url)    // 内存已爬集合同步增量
     } catch { /* 已爬记录失败不影响正文落盘（最坏下次重爬该 url，幂等） */ }
   }
 
