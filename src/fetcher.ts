@@ -80,7 +80,10 @@ export const fetcherPlugin = {
       ctx.on('source/register', (src: SourceConfig) => {
         if (!src?.id || started.has(src.id)) return
         started.add(src.id)
-        if (!cfg.sources.some((s) => s.id === src.id)) cfg.sources.push(src)
+        if (!cfg.sources.some((s) => s.id === src.id)) {
+          cfg.sources.push(src)
+          ctx.storage.registerSourceDirs([src])   // 源级 outDir（热接入晚于服务装配）
+        }
         ctx.logger.info('[fetcher] 热接入新源 %s（kind=%s）', src.id, src.kind)
         void runSourceOnce(ctx, cfg, src).catch((e) =>
           ctx.logger.error('[fetcher] 新源 %s 一轮失败: %s', src.id, String(e).slice(0, 160)))

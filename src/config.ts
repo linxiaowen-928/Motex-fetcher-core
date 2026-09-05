@@ -28,6 +28,9 @@ export interface SourceConfig {
   parseRule?: SiteParseRule
   /** 二进制直落盘（音频/压缩包等：跳过解析，按 url 哈希存文件 + 元数据 jsonl） */
   downloadRaw?: boolean
+  /** 【源级输出目录】相对运行目录（2026-09-05 架构修正：多源共享 fetcher 时每源自己声明
+   *  输出位置，不搞全局；缺省回退 storage.outDir）——本源的 jsonl/done.urls/fails/meta 都落这里 */
+  outDir?: string
 }
 
 export interface SchedulerConfig {
@@ -71,8 +74,8 @@ export interface SchedulerConfig {
 }
 
 export interface StorageConfig {
-  /** JSONL 输出目录 */
-  outDir: string
+  /** 全局兜底输出目录（源未声明 outDir 时用；站点扩展应每源声明 outDir） */
+  outDir?: string
   /** 落盘时剥离文本中的换行（训练语料不需要段落 \n；默认开） */
   stripNewlines?: boolean
 }

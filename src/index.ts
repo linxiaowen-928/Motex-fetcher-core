@@ -20,7 +20,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSyn
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
 import { join, resolve } from 'node:path'
-import { loadConfig, type FetcherConfig, type SchedulerConfig, type StorageConfig } from './config.ts'
+import { loadConfig, type FetcherConfig, type SchedulerConfig, type SourceConfig, type StorageConfig } from './config.ts'
 import { SchedulerService, type SchedulerSnapshot } from './services/scheduler.ts'
 export { SchedulerService, IndexerService, ParserService, StorageService }
 import { IndexerService } from './services/indexer.ts' // re-export 见下方
@@ -37,6 +37,12 @@ import { freshLogFile, setTraceFile, tlog } from './trace.ts'
 
 const enc = new TextEncoder()
 
+/** 源输出目录（绝对）：源级 outDir 优先，缺省回退全局 storage.outDir（2026-09-05 架构：站点扩展自己声明输出位置） */
+function sourceOutDir(cfg: FetcherConfig, srcId: string): string {
+  const s = cfg.sources.find((x) => x.id === srcId)
+  return join(process.cwd(), s?.outDir ?? cfg.storage.outDir ?? 'out')
+}
+
 /**
  * 扩展选项：把 cordis 的 DI/事件/插件能力暴露给使用方——
  * - services：替换核心服务（自定义 scheduler/storage/parser/indexer，可继承默认类魔改）
@@ -48,7 +54,7 @@ export interface FetchCoreOptions {
     scheduler: new (ctx: Context, cfg: SchedulerConfig) => SchedulerService
     indexer: new (ctx: Context) => IndexerService
     parser: new (ctx: Context) => ParserService
-    storage: new (ctx: Context, cfg: StorageConfig) => StorageService
+    storage: new (ctx: Context, cfg: StorageConfig, sources?: SourceConfig[]) => StorageService
   }>
   plugins?: any[]
   beforeServices?: (ctx: Context, cfg: FetcherConfig) => void
@@ -66,7 +72,7 @@ export function assembleApp(ctx: Context, cfg: FetcherConfig, opts: FetchCoreOpt
   const P = opts.services?.parser ?? ParserService
   new P(ctx)
   const St = opts.services?.storage ?? StorageService
-  new St(ctx, cfg.storage)
+  new St(ctx, cfg.storage, cfg.sources)
   ctx.plugin(pipelinePlugin, cfg)
   for (const p of opts.plugins ?? []) ctx.plugin(p, cfg)
   opts.afterServices?.(ctx, cfg)
@@ -298,7 +304,7 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
           // 慢路径（仅首次）：流式扫 JSONL 生成 done.urls（避免 GB 级文件全量进内存）。
           const seen = new Set<string>()
           for (const src of new Set(pool.map((p) => p.source))) {
-            const donePath = join(process.cwd(), cfg.storage.outDir, `${src}.done.urls`)
+            const donePath = join(sourceOutDir(cfg, src), `${src}.done.urls`)
             if (existsSync(donePath)) {
               const text = readFileSync(donePath, 'utf-8')
               for (const ln of text.split('\n')) {
@@ -308,7 +314,7 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
               app.logger.info('skipExisting：快路径 %s（%d 条已爬）', donePath, seen.size)
             } else {
               // 慢路径（仅首次）：流式扫 JSONL 全部分片（主文件 + .partN）生成 done.urls
-              const outDir = join(process.cwd(), cfg.storage.outDir)
+              const outDir = sourceOutDir(cfg, src)
               const jsonls = existsSync(outDir)
                 ? readdirSync(outDir).filter((f) => f === `${src}.jsonl` || f.startsWith(`${src}.jsonl.part`)).sort()
                 : []
