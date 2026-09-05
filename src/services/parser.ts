@@ -39,20 +39,32 @@ export class ParserService extends Service {
     // ---- 详情页信号：解析章节链接并入队（此页面本身不入库；章节页再走正文提取） ----
     if (rule?.chapterSignal && html.includes(rule.chapterSignal)) {
       const $ = cheerio.load(html)
-      // 动态前缀（2026-09-05 多级目录站）：章链接前缀 = 当前页 URL 书 id 段（/{bookid}/{chid}.html）——
-      // 每书不同无法静态配置，chapterLinkPrefix='__self__' 时取 pathname 第一段（如 /103837）
+      // 动态前缀（2026-09-05 多级目录站/IP限流站）：章链接前缀 = 当前页 URL 书 id 段——
+      // 每书不同无法静态配置，chapterLinkPrefix='__self__' 时取 pathname 前两段并剥分段后缀
+      // （/{cat}/{id}/ → /{cat}/{id}；/{cat}/{id}_1/ → /{cat}/{id}；/{bookid}/ → /{bookid}；单段路径兼容）
       let prefix = rule.chapterLinkPrefix ?? ''
       if (prefix === '__self__') {
         const seg = new URL(res.url).pathname.split('/').filter(Boolean)
-        prefix = '/' + (seg[0] ?? '')
+        if (seg.length >= 2) {
+          prefix = '/' + seg[0] + '/' + seg[1].replace(/_\d+$/, '')
+        } else {
+          prefix = '/' + (seg[0] ?? '')
+        }
       }
       const urls: string[] = []
       const cur = new URL(res.url)
-      $('a[href]').each((_, el) => {
-        const href = $(el).attr('href') ?? ''
+      // a[href] + select option[value]（IP限流站 分段下拉：option value = 分段页 URL）
+      $('a[href], select option[value]').each((_, el) => {
+        let href = ''
+        if (el.tagName === 'option') {
+          href = $(el).attr('value') ?? ''
+        } else {
+          href = $(el).attr('href') ?? ''
+        }
+        if (!href || href.startsWith('#')) return
         if (prefix && !href.includes(prefix)) return
         try {
-          const abs = new URL(href, cur).href
+          const abs = new URL(href.split('#')[0], cur).href   // 剥锚点（#all 等）
           if (abs !== res.url) urls.push(abs)      // 剔除自身回链
         } catch { /* 忽略坏链接 */ }
       })
