@@ -112,7 +112,8 @@ export const fetcherPlugin = {
       })
       const phase = (config.phase ?? cfg.phase ?? 'both') as 'index' | 'crawl' | 'both' | 'update'
       const wantCrawl = phase === 'crawl' || phase === 'both'
-      const wantIndex = phase === 'index' || phase === 'both'
+      // 发现循环：phase 含 index，或显式给了 indexIntervalSec（纯 crawl watch 形态也开发现）
+      const wantIndex = phase === 'index' || phase === 'both' || config.indexIntervalSec !== undefined
       // detached fibers：不能 await（loader.await 会等 apply 内所有任务落定 → 永不落定挂死）
       if (wantCrawl) {
         void (async () => {
