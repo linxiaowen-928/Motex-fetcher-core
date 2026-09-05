@@ -429,11 +429,21 @@ export async function runCrawlTail(
       bySrc.delete(src.id)
     }
   }
-  for (const [sid, urls] of bySrc) {
-    // force：池 URL 绕过 visited（2026-09-05 指纹风控站 崩溃恢复死循环修复——
-    // restore 恢复的 visited 含上次会话在跑的池 URL，push 全被去重跳过 → 无事可做秒退；
-    // 池 URL 防重由 skipExisting/done.urls 负责，force 安全）
-    await app.scheduler.push(urls, sid, 0, { force: true })
+  // 入队（2026-09-05 多源公平）：按 CHUNK 轮转各源入队（不逐批 await——按批结算已修，
+  // 多批可同时在队），避免大池源整块占队头把其余源饿死几小时（试点实测：单源独占 4 并发窗）。
+  const CHUNK = 500
+  const entries = [...bySrc.entries()]
+  const maxLen = Math.max(0, ...entries.map(([, u]) => u.length))
+  for (let pos = 0; pos < maxLen; pos += CHUNK) {
+    for (const [sid, urls] of entries) {
+      const slice = urls.slice(pos, pos + CHUNK)
+      if (slice.length) {
+        // force：池 URL 绕过 visited（2026-09-05 指纹风控站 崩溃恢复死循环修复——
+        // restore 恢复的 visited 含上次会话在跑的池 URL，push 全被去重跳过 → 无事可做秒退；
+        // 池 URL 防重由 skipExisting/done.urls 负责，force 安全）
+        void app.scheduler.push(slice, sid, 0, { force: true })
+      }
+    }
   }
   await app.scheduler.waitIdle()     // 全部落定（含分页续推）；暂停后立即返回
   tlog({ ev: 'crawl_main_done', ok: s.ok, failed: s.failed, requeued: s.requeued, skipped: s.skipped })

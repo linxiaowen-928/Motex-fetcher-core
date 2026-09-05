@@ -36,6 +36,7 @@ type Outcome = { kind: 'ok'; res: FetchResponse } | { kind: 'transient'; res?: F
 interface Job extends FetchJob {
   attempts: number       // 已尝试次数（含重入队）
   requeues: number       // 重入队次数
+  batchId?: number       // 所属批次（push 的 id；按批结算用——2026-09-05 多批并发修复）
 }
 
 export interface SchedulerStats {
@@ -373,6 +374,7 @@ export class SchedulerService extends Service {
       this.visited.add(url)
       const job = {
         url, source, depth, createdAt: Date.now(), attempts: 0, requeues: 0,
+        batchId: id,
         continuationOf: opts?.continuationOf,
       }
       if (opts?.front) this.queue.unshift(job)
@@ -505,7 +507,7 @@ export class SchedulerService extends Service {
     if (outcome.kind === 'ok') {
       this.stats.ok++
       this.lastFinish = Date.now()
-      tlog({ ev: 'req_end', url: job.url, ok: true, status: outcome.res?.status ?? 200, ms: Date.now() - t0, attempts: job.attempts })
+      tlog({ ev: 'req_end', url: job.url, source: job.source, ok: true, status: outcome.res?.status ?? 200, ms: Date.now() - t0, attempts: job.attempts })
       await this.ctx.parallel('fetch/response', outcome.res)   // parallel：等待监听器（解析/落盘）完成后才算任务终局
       this.finishJob(job)
       return
@@ -546,11 +548,17 @@ export class SchedulerService extends Service {
     this.finishJob(job)
   }
 
-  /** 从一个待结算批次里扣减一个终局任务；批次清零才 resolve 该批 Promise */
+  /** 从一个待结算批次里扣减一个终局任务；该批清零才 resolve。
+   *  ⚠️ 按【任务所属批次】记账（2026-09-05 多批并发修复）：旧实现每完成一个任务就扣减
+   *  全部 pending 批次——多批同时在队时账目全乱，逼得调用方只能逐批 await（整源串行饿死）。 */
   private finishJob(job: Job) {
-    for (const [, h] of this.pending) {
-      h.jobsLeft--
-      if (h.jobsLeft <= 0) h.done()
+    if (job.batchId === undefined) return          // restore 回填的任务不属本进程任何批次
+    const h = this.pending.get(job.batchId)
+    if (!h) return
+    h.jobsLeft--
+    if (h.jobsLeft <= 0) {
+      this.pending.delete(job.batchId)
+      h.done()
     }
   }
 
