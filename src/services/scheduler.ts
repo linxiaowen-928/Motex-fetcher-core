@@ -260,8 +260,8 @@ export class SchedulerService extends Service {
    *  无策略 → 当前 client（注入的自定义 client——自检等；或默认客户端）。
    *  ⚠️ cordis 经 ctx 访问服务时方法/字段会被 getTraceable 逐读包装（新代理）——
    *  切勿对字段做身份比较（2026-09-05 实测 this.client !== this.client）。 */
-  private clientFor(job: Job): HttpClient {
-    const pol = this.policyOf(job.source)
+  private pickClient(sourceId: string): HttpClient {
+    const pol = this.policyOf(sourceId)
     const t = pol?.transport
     if (t?.curlMode) {
       return (u, ms) => this.curlClient(u, ms, pol!.rotator)
@@ -271,6 +271,17 @@ export class SchedulerService extends Service {
       return (u, ms) => this.proxyClient(u, ms, pol.rotator!, attempts, t!.proxyMode)
     }
     return this.client
+  }
+
+  private clientFor(job: Job): HttpClient {
+    return this.pickClient(job.source)
+  }
+
+  /** 旁路抓取（发现/BFS/追更等【不走队列】的调用）：按源路由客户端。
+   *  多源共享进程里发现路径必须与正文同策略（curl/代理站拿错客户端 = 全挂，2026-09-05）。 */
+  async fetchFor(sourceId: string, url: string, timeoutMs?: number) {
+    const client = this.pickClient(sourceId)
+    return client(url, timeoutMs ?? this.config.timeoutMs)
   }
 
   private async defaultClient(url: string, timeoutMs: number) {
@@ -391,20 +402,7 @@ export class SchedulerService extends Service {
       while (true) {
         if (this.paused) break
         if (this.queue.length && this.running < this.config.concurrency) {
-          const job = this.queue.shift()!
-          // 源级限速节奏（多源共进程时各站独立 delayMs；无策略源回退全局）
-          const srcDelay = this.delayOf(job.source)
-          const lastStart = this.lastStartBySrc.get(job.source) ?? 0
-          const wait = srcDelay - (Date.now() - lastStart)
-          if (wait > 0) await sleep(wait)
-          this.lastStartBySrc.set(job.source, Date.now())
-          this.running++
-          void this.runOne(job)
-            .catch((e) => this.ctx.logger.error('job crashed: %s (%s)', job.url, String(e)))
-            .finally(() => {
-              this.running--
-              void this.loop()
-            })
+          await this.dispatchOne()     // 公平取队 + 源级限速（内部可能等待节奏）
         } else if (this.queue.length === 0 && this.running === 0 && this.park.length === 0) {
           this.ctx.logger.debug('scheduler drained')
           void this.checkpoint()               // 批次清空后自动落一次 checkpoint（断点）
@@ -418,6 +416,48 @@ export class SchedulerService extends Service {
     } finally {
       this.loopBusy = false
     }
+  }
+
+  /** 公平派发一个任务（2026-09-05 多源共享）：窗口内优先取【限速已就绪】且【在飞最少】的源的任务——
+   *  防大池源饿死小池源（全池 force 入队时队列按源成块，纯 FIFO 会让后面的源等到天荒地老）。
+   *  窗口内无就绪任务 → 睡到最早就绪时刻再试。 */
+  private runningBySrc = new Map<string, number>()
+
+  private async dispatchOne(): Promise<void> {
+    const WINDOW = 64
+    const n = Math.min(this.queue.length, WINDOW)
+    const now = Date.now()
+    let best = -1
+    let bestActive = Infinity
+    let minWait = Infinity
+    for (let i = 0; i < n; i++) {
+      const j = this.queue[i]!
+      const active = this.runningBySrc.get(j.source) ?? 0
+      const wait = this.delayOf(j.source) - (now - (this.lastStartBySrc.get(j.source) ?? 0))
+      if (wait <= 0 && active < bestActive) {
+        bestActive = active
+        best = i
+        if (active === 0) break                 // 有空闲源任务就绪 → 不用再找
+      }
+      if (wait > 0 && wait < minWait) minWait = wait
+    }
+    if (best < 0) {
+      if (minWait < Infinity) await sleep(minWait)
+      return
+    }
+    const [job] = this.queue.splice(best, 1)
+    this.lastStartBySrc.set(job.source, Date.now())
+    this.running++
+    this.runningBySrc.set(job.source, (this.runningBySrc.get(job.source) ?? 0) + 1)
+    void this.runOne(job)
+      .catch((e) => this.ctx.logger.error('job crashed: %s (%s)', job.url, String(e)))
+      .finally(() => {
+        this.running--
+        const left = (this.runningBySrc.get(job.source) ?? 1) - 1
+        if (left <= 0) this.runningBySrc.delete(job.source)
+        else this.runningBySrc.set(job.source, left)
+        void this.loop()
+      })
   }
 
   /** 单个任务：尝试 → 分类结局 → (重试退避 | 瞬时失败重入队 | 永久失败) */

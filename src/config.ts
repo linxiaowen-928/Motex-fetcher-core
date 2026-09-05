@@ -34,6 +34,9 @@ export interface SourceConfig {
   /** 【源级索引池文件】相对运行目录（多源共享 fetcher 时每源自己的池；
    *  缺省：单源回退全局 indexFile，多源 pool/<id>.index.jsonl） */
   indexFile?: string
+  /** 【源级发现轮间隔秒】（watch 单进程形态：本源的 discover 周期；缺省回退插件 indexIntervalSec，
+   *  再缺省 3600。发现是旁路抓取，与正文爬并行不抢队列） */
+  indexIntervalSec?: number
   /** 【源级传输策略】（2026-09-05 架构修正：多源共享 fetcher 时每源自己声明网络行为——
    *  TLS 指纹站 curl 抓取 / IP 限速站代理轮换 / 每源限速节奏；缺省字段回退全局 scheduler。
    *  注：并发窗口仍是全局总闸，各源节奏靠 delayMs 独立控制） */

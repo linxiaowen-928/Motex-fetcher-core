@@ -19,7 +19,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createReadStream } from 'node:fs'
 import { createInterface } from 'node:readline'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { loadConfig, type FetcherConfig, type SchedulerConfig, type SourceConfig, type StorageConfig } from './config.ts'
 import { SchedulerService, type SchedulerSnapshot } from './services/scheduler.ts'
 export { SchedulerService, IndexerService, ParserService, StorageService }
@@ -462,6 +462,27 @@ export async function runCrawlSweep(app: Context, cfg: FetcherConfig, opts: RunP
     app.logger.info('[sweep] 池 %s：%d 条', file, recs.length)
   }
   await runCrawlTail(app, cfg, pool, { limit: opts.limit ?? 0, selfTest: opts.selfTest })
+}
+
+/** 单源发现轮（fetcher watch 模式用）：开该源索引池 → discover（site 类由 handler pushIndex 增量落池；
+ *  非 site 类把返回 URL 直接补池）→ 返回新增条数。旁路抓取（不走调度队列），与正文爬并行。 */
+export async function runIndexSweep(app: Context, cfg: FetcherConfig, src: SourceConfig): Promise<number> {
+  const file = sourceIndexFile(cfg, src)
+  app.indexer.beginIndex(file)                          // 每源轮前切换池文件
+  const urls = await app.indexer.discover(src)
+  let added = urls.length
+  if (src.kind !== 'site' && urls.length) {
+    // static/index 源：discover 返回未落池（site 源由 handler pushIndex）→ 手动补
+    try {
+      const p = join(process.cwd(), file)
+      mkdirSync(dirname(p), { recursive: true })
+      appendFileSync(p, urls.map((u) => JSON.stringify({ url: u, source: src.id }) + '\n').join(''))
+    } catch (e) {
+      app.logger.warn('[index] 源 %s 补池失败: %s', src.id, String(e).slice(0, 120))
+    }
+  }
+  app.logger.info('[index] 发现轮 %s：新增 %d 条 → %s', src.id, added, file)
+  return added
 }
 
 export async function main(argv?: string[], opts: FetchCoreOptions = {}) {

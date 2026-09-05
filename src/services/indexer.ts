@@ -46,7 +46,7 @@ export class IndexerService extends Service {
         this.ctx.logger.error('[indexer] 未提供站点处理器 %s（项目需注册 cordis 服务 site.%s）', source.siteHandler, source.siteHandler)
         return []
       }
-      return h.discover(this.ctx, source)
+      return h.discover(this.sourceScopedCtx(source), source)
     }
     if (source.kind === 'static' || !source.indexRule) {
       return source.seedUrls
@@ -54,7 +54,7 @@ export class IndexerService extends Service {
     const out = new Set<string>()
     for (const seed of source.seedUrls) {
       try {
-        const r = await this.ctx.scheduler.client(seed, 30000)
+        const r = await this.ctx.scheduler.fetchFor(source.id, seed, 30000)
         if (!r.ok || !r.body) {
           this.ctx.logger.warn('[indexer] 目录页失败 %s (HTTP %s)', seed, r.status)
           continue
@@ -70,6 +70,26 @@ export class IndexerService extends Service {
     }
     this.ctx.logger.info('[indexer] 源 %s：目录发现 %d 个 URL', source.id, out.size)
     return [...out]
+  }
+
+  /** 给站点 handler 一个“按源路由”的子 ctx（2026-09-05 多源共享进程）：
+   *  站点适配器的旁路抓取走 ctx.scheduler.client——单进程多源时必须按源走 transport 策略
+   *  （curl/代理），否则拿错客户端全挂。适配器只用 scheduler.client + indexer.pushIndex +
+   *  logger 三样（已全量核对），故只遮蔽 scheduler；pushIndex 经真实 indexer（池文件已由
+   *  beginIndex 切到本源），logger 走原型链继承。
+   *  ⚠️ scheduler 只给 client/push 两个成员——队列任务请勿经此 ctx 派发（fetchFor 是旁路）。 */
+  private sourceScopedCtx(source: SourceConfig): Context {
+    const real = this.ctx
+    const sub = real.extend({}) as Context
+    const sched = real.scheduler
+    Object.defineProperty(sub, 'scheduler', {
+      value: {
+        client: (url: string, timeout?: number) => sched.fetchFor(source.id, url, timeout),
+        push: (...args: Parameters<typeof sched.push>) => sched.push(...args),
+      },
+      configurable: false,
+    })
+    return sub
   }
 
   /** 等待站点处理器注册（loader 并行 apply 竞态兜底：轮询最多 timeoutMs）

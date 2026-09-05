@@ -58,7 +58,7 @@ export async function runUpdate(
       const rec = ongoing[idx++]
       await sleep(delayMs)
       try {
-        const r = await ctx.scheduler.client(rec.url, 30000)
+        const r = await ctx.scheduler.fetchFor(source.id, rec.url, 30000)
         if (!r.ok || !r.body) {
           tlog({ ev: 'update_fetch_fail', url: rec.url })
           continue

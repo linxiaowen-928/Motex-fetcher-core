@@ -55,7 +55,7 @@ export async function runBfsDiscover(ctx: Context, source: SourceConfig, o: BfsO
   const fetchPage = async (url: string): Promise<string | null> => {
     for (let attempt = 1; attempt <= retries + 1; attempt++) {
       try {
-        const r = await ctx.scheduler.client(url, 25000)
+        const r = await ctx.scheduler.fetchFor(source.id, url, 25000)
         if (r.ok && r.body) return decodeBytes(r.body, 'utf-8')
         if (r.status === 429 || r.status === 403) {
           tlog({ ev: 'bfs_limited', url, status: r.status, attempt })
