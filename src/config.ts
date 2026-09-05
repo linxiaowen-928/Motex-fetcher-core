@@ -31,6 +31,9 @@ export interface SourceConfig {
   /** 【源级输出目录】相对运行目录（2026-09-05 架构修正：多源共享 fetcher 时每源自己声明
    *  输出位置，不搞全局；缺省回退 storage.outDir）——本源的 jsonl/done.urls/fails/meta 都落这里 */
   outDir?: string
+  /** 【源级索引池文件】相对运行目录（多源共享 fetcher 时每源自己的池；
+   *  缺省：单源回退全局 indexFile，多源 pool/<id>.index.jsonl） */
+  indexFile?: string
 }
 
 export interface SchedulerConfig {

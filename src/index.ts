@@ -293,102 +293,15 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
         tlog({ ev: 'update_plan', added })
       } else {
         if (phase === 'crawl') {
-          // 从索引池恢复爬取任务
-          const recs = loadIndex(indexFile)
-          for (const r of recs) pool.push({ url: r.url, source: r.source })
-          app.logger.info('索引池：%d 条', recs.length)
-        }
-        if (cfg.skipExisting) {
-          // 跳过已在输出 JSONL 中存在的 url（断点式续爬）
-          // 快路径：读 <src>.done.urls 已爬记录（storage.append 增量维护，纯 url 行）；
-          // 慢路径（仅首次）：流式扫 JSONL 生成 done.urls（避免 GB 级文件全量进内存）。
-          const seen = new Set<string>()
-          for (const src of new Set(pool.map((p) => p.source))) {
-            const donePath = join(sourceOutDir(cfg, src), `${src}.done.urls`)
-            if (existsSync(donePath)) {
-              const text = readFileSync(donePath, 'utf-8')
-              for (const ln of text.split('\n')) {
-                const u = ln.trim()
-                if (u) seen.add(u)
-              }
-              app.logger.info('skipExisting：快路径 %s（%d 条已爬）', donePath, seen.size)
-            } else {
-              // 慢路径（仅首次）：流式扫 JSONL 全部分片（主文件 + .partN）生成 done.urls
-              const outDir = sourceOutDir(cfg, src)
-              const jsonls = existsSync(outDir)
-                ? readdirSync(outDir).filter((f) => f === `${src}.jsonl` || f.startsWith(`${src}.jsonl.part`)).sort()
-                : []
-              let n = 0
-              let buf: string[] = []
-              for (const jf of jsonls) {
-                const rl = createInterface({ input: createReadStream(join(outDir, jf)), crlfDelay: Infinity })
-                for await (const ln of rl) {
-                  try {
-                    const u = (JSON.parse(ln) as { url: string }).url
-                    if (u) {
-                      seen.add(u)
-                      buf.push(u)
-                    }
-                  } catch { /* 坏行忽略 */ }
-                  if (buf.length >= 8000) {
-                    appendFileSync(donePath, buf.join('\n') + '\n')
-                    buf = []
-                  }
-                }
-              }
-              if (buf.length) appendFileSync(donePath, buf.join('\n') + '\n')
-              n = seen.size
-              app.logger.info('skipExisting：首次生成 %s（%d 条已爬，%d 分片流式扫描）', donePath, n, jsonls.length)
-            }
-          }
-          const before = pool.length
-          const kept = pool.filter((p) => !seen.has(p.url))
-          app.logger.info('skipExisting：过滤 %d 条已爬，剩 %d 条', before - kept.length, kept.length)
-          pool.length = 0
-          for (const k of kept) pool.push(k)      // 不用 ...spread：十几万元素会被调用栈限制爆掉
-        }
-        if (limit > 0) pool.length = Math.min(pool.length, limit)
-        tlog({ ev: 'crawl_plan', pool: pool.length, phase })
-        total = pool.length
-        // 按源分批入队（并发/重试/去重/断点保护由调度器负责）
-        const bySrc = new Map<string, string[]>()
-        for (const p of pool) {
-          if (!bySrc.has(p.source)) bySrc.set(p.source, [])
-          bySrc.get(p.source)!.push(p.url)
-        }
-        // downloadRaw 源（大文件）走流式直落盘，不进内存队列
-        // （selfTest 排除：自检用 mock client 验证 saveBinary 小文件路径）
-        if (!selfTest) {
+          // 从索引池恢复爬取任务（按源：源级 indexFile 优先——多源共享 fetcher 时每源自己的池）
           for (const src of cfg.sources) {
-            if (!src.downloadRaw) continue
-            const urls = bySrc.get(src.id)
-            if (!urls || !urls.length) continue
-            app.logger.info('downloadRaw 源 %s：流式下载 %d 个文件', src.id, urls.length)
-            tlog({ ev: 'raw_download_start', source: src.id, n: urls.length })
-            const r = await app.storage.downloadRawFiles(urls, src.id)
-            tlog({ ev: 'raw_download_done', source: src.id, ok: r.ok, skipped: r.skipped, failed: r.failed })
-            bySrc.delete(src.id)
+            const file = sourceIndexFile(cfg, src)
+            const recs = loadIndex(file)
+            for (const r of recs) pool.push({ url: r.url, source: r.source })
+            app.logger.info('索引池 %s：%d 条', file, recs.length)
           }
         }
-        for (const [sid, urls] of bySrc) {
-          // force：池 URL 绕过 visited（2026-09-05 指纹风控站 崩溃恢复死循环修复——
-          // restore 恢复的 visited 含上次会话在跑的池 URL，push 全被去重跳过 → 无事可做秒退；
-          // 池 URL 防重由 skipExisting/done.urls 负责，force 安全）
-          await app.scheduler.push(urls, sid, 0, { force: true })
-        }
-      }
-      await app.scheduler.waitIdle()     // 全部落定（含分页续推）；暂停后立即返回
-      tlog({ ev: 'crawl_main_done', ok: s.ok, failed: s.failed, requeued: s.requeued, skipped: s.skipped })
-      // 兜底重试轮：终局失败不能直接放弃（用户要求）；已暂停则跳过（checkpoint 已含失败清单，恢复后再跑）
-      if (!paused) {
-        const retryPasses = cfg.scheduler.failRetryPasses ?? 1
-        for (let i = 0; i < retryPasses; i++) {
-          const n = await app.scheduler.retryFailedPass()
-          if (!n) break
-          await app.scheduler.waitIdle()
-          app.logger.warn('兜底重试第 %d 轮完成（重试 %d 个）', i + 1, n)
-          tlog({ ev: 'crawl_retry_done', pass: i + 1, n })
-        }
+        await runCrawlTail(app, cfg, pool, { limit, selfTest })
       }
     } finally {
       if (iv) clearInterval(iv)
@@ -426,6 +339,129 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
     console.log(`[motex-fetcher] 完成：成功 ${s.ok} / 终局失败 ${s.failed} / 重入队 ${s.requeued} / 去重跳过 ${s.skipped}（${secs}s）`)
   }
   return { paused }
+}
+
+/** 源索引池文件（相对运行目录）：源级 indexFile 优先；单源回退全局 indexFile；多源缺省 pool/<id>.index.jsonl */
+function sourceIndexFile(cfg: FetcherConfig, src: SourceConfig): string {
+  if (src.indexFile) return src.indexFile
+  if (cfg.sources.length === 1 && cfg.indexFile) return cfg.indexFile
+  return `pool/${src.id}.index.jsonl`
+}
+
+/** 爬取收尾（runPhase 与 watch 常驻扫池共用）：skipExisting → 限数 → 按源入队（force）→ 落定 → 兜底重试。
+ *  优雅暂停：waitIdle 立即返回；已暂停则跳过兜底重试（checkpoint 已含失败清单，恢复后再跑）。 */
+export async function runCrawlTail(
+  app: Context, cfg: FetcherConfig,
+  pool: { url: string; source: string }[],
+  opts: { limit?: number; selfTest?: boolean } = {},
+): Promise<void> {
+  const limit = opts.limit ?? 0
+  const selfTest = opts.selfTest ?? false
+  const s = app.scheduler.stats
+  if (cfg.skipExisting) {
+    // 跳过已在输出 JSONL 中存在的 url（断点式续爬）
+    // 快路径：读 <src>.done.urls 已爬记录（storage.append 增量维护，纯 url 行）；
+    // 慢路径（仅首次）：流式扫 JSONL 生成 done.urls（避免 GB 级文件全量进内存）。
+    const seen = new Set<string>()
+    for (const src of new Set(pool.map((p) => p.source))) {
+      const donePath = join(sourceOutDir(cfg, src), `${src}.done.urls`)
+      if (existsSync(donePath)) {
+        const text = readFileSync(donePath, 'utf-8')
+        for (const ln of text.split('\n')) {
+          const u = ln.trim()
+          if (u) seen.add(u)
+        }
+        app.logger.info('skipExisting：快路径 %s（%d 条已爬）', donePath, seen.size)
+      } else {
+        // 慢路径（仅首次）：流式扫 JSONL 全部分片（主文件 + .partN）生成 done.urls
+        const outDir = sourceOutDir(cfg, src)
+        const jsonls = existsSync(outDir)
+          ? readdirSync(outDir).filter((f) => f === `${src}.jsonl` || f.startsWith(`${src}.jsonl.part`)).sort()
+          : []
+        let n = 0
+        let buf: string[] = []
+        for (const jf of jsonls) {
+          const rl = createInterface({ input: createReadStream(join(outDir, jf)), crlfDelay: Infinity })
+          for await (const ln of rl) {
+            try {
+              const u = (JSON.parse(ln) as { url: string }).url
+              if (u) {
+                seen.add(u)
+                buf.push(u)
+              }
+            } catch { /* 坏行忽略 */ }
+            if (buf.length >= 8000) {
+              appendFileSync(donePath, buf.join('\n') + '\n')
+              buf = []
+            }
+          }
+        }
+        if (buf.length) appendFileSync(donePath, buf.join('\n') + '\n')
+        n = seen.size
+        app.logger.info('skipExisting：首次生成 %s（%d 条已爬，%d 分片流式扫描）', donePath, n, jsonls.length)
+      }
+    }
+    const before = pool.length
+    const kept = pool.filter((p) => !seen.has(p.url))
+    app.logger.info('skipExisting：过滤 %d 条已爬，剩 %d 条', before - kept.length, kept.length)
+    pool.length = 0
+    for (const k of kept) pool.push(k)      // 不用 ...spread：十几万元素会被调用栈限制爆掉
+  }
+  if (limit > 0) pool.length = Math.min(pool.length, limit)
+  tlog({ ev: 'crawl_plan', pool: pool.length })
+  // 按源分批入队（并发/重试/去重/断点保护由调度器负责）
+  const bySrc = new Map<string, string[]>()
+  for (const p of pool) {
+    if (!bySrc.has(p.source)) bySrc.set(p.source, [])
+    bySrc.get(p.source)!.push(p.url)
+  }
+  // downloadRaw 源（大文件）走流式直落盘，不进内存队列
+  // （selfTest 排除：自检用 mock client 验证 saveBinary 小文件路径）
+  if (!selfTest) {
+    for (const src of cfg.sources) {
+      if (!src.downloadRaw) continue
+      const urls = bySrc.get(src.id)
+      if (!urls || !urls.length) continue
+      app.logger.info('downloadRaw 源 %s：流式下载 %d 个文件', src.id, urls.length)
+      tlog({ ev: 'raw_download_start', source: src.id, n: urls.length })
+      const r = await app.storage.downloadRawFiles(urls, src.id)
+      tlog({ ev: 'raw_download_done', source: src.id, ok: r.ok, skipped: r.skipped, failed: r.failed })
+      bySrc.delete(src.id)
+    }
+  }
+  for (const [sid, urls] of bySrc) {
+    // force：池 URL 绕过 visited（2026-09-05 指纹风控站 崩溃恢复死循环修复——
+    // restore 恢复的 visited 含上次会话在跑的池 URL，push 全被去重跳过 → 无事可做秒退；
+    // 池 URL 防重由 skipExisting/done.urls 负责，force 安全）
+    await app.scheduler.push(urls, sid, 0, { force: true })
+  }
+  await app.scheduler.waitIdle()     // 全部落定（含分页续推）；暂停后立即返回
+  tlog({ ev: 'crawl_main_done', ok: s.ok, failed: s.failed, requeued: s.requeued, skipped: s.skipped })
+  // 兜底重试轮：终局失败不能直接放弃（用户要求）；已暂停则跳过（checkpoint 已含失败清单，恢复后再跑）
+  if (!app.scheduler.isPaused()) {
+    const retryPasses = cfg.scheduler.failRetryPasses ?? 1
+    for (let i = 0; i < retryPasses; i++) {
+      const n = await app.scheduler.retryFailedPass()
+      if (!n) break
+      await app.scheduler.waitIdle()
+      app.logger.warn('兜底重试第 %d 轮完成（重试 %d 个）', i + 1, n)
+      tlog({ ev: 'crawl_retry_done', pass: i + 1, n })
+    }
+  }
+}
+
+/** 常驻扫池一轮（fetcher watch 模式用）：按源加载各自索引池 → 爬取收尾。
+ *  等价于标准进程“重启一轮”的效果——watch 进程周期调用即实现无需重启的续爬/追更
+ *  （池由独立 index 阶段进程持续追加；池 URL 防重靠 done.urls + force push）。 */
+export async function runCrawlSweep(app: Context, cfg: FetcherConfig, opts: RunPhaseOptions = {}): Promise<void> {
+  const pool: { url: string; source: string }[] = []
+  for (const src of cfg.sources) {
+    const file = sourceIndexFile(cfg, src)
+    const recs = loadIndex(file)
+    for (const r of recs) pool.push({ url: r.url, source: r.source })
+    app.logger.info('[sweep] 池 %s：%d 条', file, recs.length)
+  }
+  await runCrawlTail(app, cfg, pool, { limit: opts.limit ?? 0, selfTest: opts.selfTest })
 }
 
 export async function main(argv?: string[], opts: FetchCoreOptions = {}) {
