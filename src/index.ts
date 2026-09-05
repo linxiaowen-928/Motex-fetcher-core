@@ -365,7 +365,10 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
           }
         }
         for (const [sid, urls] of bySrc) {
-          await app.scheduler.push(urls, sid, 0)
+          // force：池 URL 绕过 visited（2026-09-05 指纹风控站 崩溃恢复死循环修复——
+          // restore 恢复的 visited 含上次会话在跑的池 URL，push 全被去重跳过 → 无事可做秒退；
+          // 池 URL 防重由 skipExisting/done.urls 负责，force 安全）
+          await app.scheduler.push(urls, sid, 0, { force: true })
         }
       }
       await app.scheduler.waitIdle()     // 全部落定（含分页续推）；暂停后立即返回
