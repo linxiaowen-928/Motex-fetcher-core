@@ -26,6 +26,13 @@ export class StorageService extends Service {
    *  免扫池每轮全量重读 done.urls（SMR 盘同步读可卡死事件循环数分钟，试点实测） */
   private readonly doneSets = new Map<string, Set<string>>()
   private readonly doneLoads = new Map<string, Promise<Set<string>>>()
+  /** 本进程成功落盘条目计数（空转检测用：请求 ok 连涨但 produced 不涨 = 风控软壳/解析失效） */
+  private produced = 0
+
+  /** 本进程成功产出数（正文 append + 二进制 saveBinary） */
+  get producedCount(): number {
+    return this.produced
+  }
 
   constructor(ctx: Context, config: StorageConfig, sources?: SourceConfig[]) {
     super(ctx, 'storage')
@@ -117,6 +124,7 @@ export class StorageService extends Service {
       await appendFile(join(dir, `${out.source}.done.urls`), out.url + '\n', 'utf-8')
       this.doneSets.get(out.source)?.add(out.url)    // 内存已爬集合同步增量
     } catch { /* 已爬记录失败不影响正文落盘（最坏下次重爬该 url，幂等） */ }
+    this.produced++
   }
 
   private sanitize(item: ParsedItem): ParsedItem {
@@ -159,6 +167,7 @@ export class StorageService extends Service {
     await appendFile(join(dir, `${res.source}.meta.jsonl`),
       JSON.stringify({ url: res.url, file, ext, size: res.body.length, at: new Date().toISOString() }) + '\n', 'utf-8')
     this.ctx.logger.debug('saved binary %s/%s (%d B)', res.source, file, res.body.length)
+    this.produced++
   }
 
   /** 大文件流式下载（GB 级 tar.gz/音频包）：交给独立 worker 进程执行。

@@ -17,6 +17,7 @@ import type { SchedulerConfig, SourceConfig, SourceTransport } from '../config.t
 import type { FetchJob, FetchResponse } from '../types.ts'
 import { tlog } from '../trace.ts'
 import { execFile } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fetch as ufetch, ProxyAgent } from 'undici'
 import { SocksProxyAgent } from 'socks-proxy-agent'
@@ -121,6 +122,51 @@ export class SchedulerService extends Service {
         config.proxyMode ?? 'round-robin', config)
     }
     this.registerSources(sources ?? [])
+    // 空转自动退避（2026-09-06，单源进程）：请求连续 ok 但零落盘 = 站点风控软壳/解析失效
+    this.startAutoBackoff(sources?.length === 1 ? (sources[0]?.id ?? null) : null)
+  }
+
+  /** 空转检测 + 指数退避（2026-09-06："检测到空转就自己退避休眠，越等越长"）：
+   *  每 60s 对比成功请求增量 vs 落盘增量：ok≥30 且产出 0 且运行 ≥5min → 判空转
+   *  → 写 state/pause_<src>.flag（进程 5s 内 checkpoint 退出，core_watch 不再拉起）
+   *    + state/backoff_<src>.json {until, level}（时长 1h→2h→4h→8h 指数上限）
+   *  core_watch 到期自动删 flag 恢复 → 进程重启后再空转 → 时长翻倍（越等越长，全自动循环）。
+   *  ⚠️ 多源 watch 进程不启用（退避粒度是进程/单源；watch 形态待后续按源聚合）。 */
+  private startAutoBackoff(srcId: string | null): void {
+    if (!srcId) return
+    const backoffFile = join(process.cwd(), 'state', `backoff_${srcId}.json`)
+    let lastOk = 0
+    let lastProd = 0
+    let armed = false
+    const born = Date.now()
+    setInterval(() => {
+      try {
+        if (this.paused || armed) return
+        const prod = this.ctx.storage?.producedCount ?? 0
+        const okDelta = this.stats.ok - lastOk
+        const prodDelta = prod - lastProd
+        lastOk = this.stats.ok
+        lastProd = prod
+        if (okDelta < 30 || prodDelta > 0) return
+        if (Date.now() - born < 5 * 60_000) return      // 启动 5min 内不判（防误伤刚起步的站）
+        // 空转：近 60s ≥30 次成功请求全部零产出 → 疑似风控软壳
+        let level = 0
+        try {
+          level = (JSON.parse(readFileSync(backoffFile, 'utf-8')) as { level?: number }).level ?? 0
+        } catch { /* 首次触发 */ }
+        const durSec = Math.min(3600 * 2 ** level, 28_800)
+        const until = Math.floor(Date.now() / 1000) + durSec
+        const stateDir = join(process.cwd(), 'state')
+        writeFileSync(join(stateDir, `pause_${srcId}.flag`), '', 'utf-8')
+        writeFileSync(backoffFile,
+          JSON.stringify({ until, level: level + 1, at: new Date().toISOString(), okDelta }), 'utf-8')
+        armed = true
+        tlog({ ev: 'backoff_armed', source: srcId, okDelta, level: level + 1, durSec, until })
+        this.ctx.logger.warn(
+          '[backoff] 源 %s 空转：近 60s %d 次成功请求零产出（疑似风控软壳）→ 自动退避 %d 分钟（第 %d 级）',
+          srcId, okDelta, durSec / 60, level + 1)
+      } catch { /* 检测/落盘失败不致命 */ }
+    }, 60_000).unref()
   }
 
   /** 装配源级传输策略（ctor 与 watch 热接入共用——晚注册的源补策略；幂等） */
