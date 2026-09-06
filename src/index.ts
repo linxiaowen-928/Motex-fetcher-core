@@ -235,17 +235,21 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
   let total = 0
   const pool: { url: string; source: string }[] = []
 
-  // ===== 优雅暂停（crawl_ctl.py 管理）：检测 state/pause_crawls.flag → checkpoint 落盘 → 干净退出 =====
+  // ===== 优雅暂停（crawl_ctl.py / web 控制台管理）：检测 state/pause_crawls.flag → checkpoint 落盘 → 干净退出 =====
+  // 2026-09-06：单源进程额外支持 per-site flag（state/pause_<site>.flag）——web 控制台单站暂停/恢复。
+  // 多源 watch 进程（sources>1）只认全局 flag（单站暂停语义不适用）。
   // 不依赖外部信号（Windows 无 SIGTERM 投递），crawler 自检标记文件，5s 内响应。
   // index 阶段（BFS）同样响应：BFS 幂等 + pool 已落盘，直接退出无损。
   // 注意：先 checkpoint 再置 paused（外部观察到暂停时快照必然已写）；selfTest 不注册（避免定时器挂住进程）。
   const pauseFile = join(process.cwd(), 'state', 'pause_crawls.flag')
+  const src0 = cfg.sources.length === 1 ? cfg.sources[0]?.id : null
+  const sitePauseFile = src0 ? join(process.cwd(), 'state', `pause_${src0}.flag`) : null
   let paused = false
   const pauseIv: ReturnType<typeof setInterval> | null = !selfTest ? setInterval(async () => {
     try {
-      if (existsSync(pauseFile)) {
+      if (existsSync(pauseFile) || (sitePauseFile && existsSync(sitePauseFile))) {
         clearInterval(pauseIv)
-        tlog({ ev: 'pause_requested' })
+        tlog({ ev: 'pause_requested', site: src0 ?? '*' })
         try {
           await app.scheduler.checkpoint()
         } catch (e) {
