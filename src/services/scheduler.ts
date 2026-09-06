@@ -696,14 +696,17 @@ export class SchedulerService extends Service {
     this.ctx.logger.info('恢复断点：队内 %d 个未终局任务', this.queuedCount())
   }
 
-  /** 把当前队列/已访问/失败清单写入状态文件（进程重启后可 restore 续跑） */
+  /** 把当前队列/已访问/失败清单写入状态文件（进程重启后可 restore 续跑）
+   *  2026-09-06：原子写（tmp + rename）——多实例交叠/中断写盘曾产出损坏 run.json → 重启恢复即崩死循环 */
   async checkpoint() {
-    const { writeFile, mkdir } = await import('node:fs/promises')
+    const { writeFile, rename, mkdir } = await import('node:fs/promises')
     const { dirname, join } = await import('node:path')
     if (!this.config.stateFile) return
     const file = join(process.cwd(), this.config.stateFile)
+    const tmp = `${file}.tmp`
     await mkdir(dirname(file), { recursive: true })
-    await writeFile(file, JSON.stringify(this.snapshot(), null, 2), 'utf-8')
+    await writeFile(tmp, JSON.stringify(this.snapshot(), null, 2), 'utf-8')
+    await rename(tmp, file)
     this.ctx.logger.debug('checkpoint 已写 %s', this.config.stateFile)
   }
 }

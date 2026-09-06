@@ -210,11 +210,25 @@ export async function runPhase(app: Context, cfg: FetcherConfig, opts: RunPhaseO
     }
   } else if (phase !== 'index') {
     // 断点恢复（仅爬取阶段）：存在状态文件 → 回填未终局队列（配合 JSONL 输出续跑）
+    // 2026-09-06：损坏快照容错——重启交叠/中断写盘可能损坏 run.json（固定偏移 JSON 解析失败即秒崩重启死循环）；
+    // 解析失败 = 放弃断点续跑（池 force push 兜底，visited 损失仅导致少量幂等重抓），并挪走坏文件防止每次重启复读
     const statePath = join(process.cwd(), cfg.scheduler.stateFile)
     if (cfg.scheduler.stateFile && existsSync(statePath)) {
-      const snap = JSON.parse(readFileSync(statePath, 'utf-8')) as SchedulerSnapshot
-      app.scheduler.restore(snap)
-      tlog({ ev: 'restored', queue: snap.queue.length, visited: snap.visited.length })
+      let snap: SchedulerSnapshot | null = null
+      try {
+        snap = JSON.parse(readFileSync(statePath, 'utf-8')) as SchedulerSnapshot
+      } catch (e) {
+        tlog({ ev: 'restore_corrupt', err: String(e).slice(0, 120) })
+        app.logger.warn('状态快照损坏（%s）→ 跳过断点恢复，rename 坏文件后重新开始', statePath)
+        try {
+          const { renameSync } = await import('node:fs')
+          renameSync(statePath, `${statePath}.corrupt-${Date.now()}`)
+        } catch { /* 挪不走则留待下次覆盖 */ }
+      }
+      if (snap) {
+        app.scheduler.restore(snap)
+        tlog({ ev: 'restored', queue: snap.queue.length, visited: snap.visited.length })
+      }
     }
     // 退出钩子：Ctrl+C / kill 时先落 checkpoint
     for (const sig of ['SIGINT', 'SIGTERM'] as const) {
